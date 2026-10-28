@@ -1,0 +1,18 @@
+# Datos del BCRA (Central de Deudores): pesados y con CUITs, nunca al repo
+24DSF*
+*.7z
+*.7Z
+Fecha_Proceso_*.txt
+LEAME DEUDORES.pdf
+
+# Salidas generadas por los scripts
+*.parquet
+*.parquet.tmp
+macro_bcra.csv
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
