@@ -48,13 +48,24 @@ Features principales:
     - left_censored (ya estaba en el mes más antiguo del archivo)
 
 Uso: python 02_construir_dataset.py
-Tiempo estimado: 30-50 min (dos pasadas sobre ~22GB)
+Tiempo estimado: ~20 min (dos pasadas sobre ~22GB), ~4GB de RAM
 Requiere: pyarrow (pip install pyarrow)
+
+Implementación pensada para correr en ~16GB de RAM:
+  - Pasada 1: los 24 meses de cada CUIT de Santander se guardan en arrays
+    compactos (sit / monto / judicial).
+  - Pasada 2: por CUIT × mes se acumulan solo los agregados que usan las
+    features (peor sit, n entidades, n sit2, n sit3+, judicial, tipos como
+    bitmask, suma de montos). El acumulador se crea recién cuando el CUIT
+    tiene deuda en otra entidad.
+  - Las líneas se descartan por entidad / CUIT antes de parsear los 24 meses.
+  - El parquet se escribe por bloques (ParquetWriter) a un .tmp que se
+    renombra al terminar.
 """
 
 import os
 import math
-from collections import defaultdict
+from array import array
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -67,6 +78,7 @@ HORIZON_C     = 12              # meses a futuro para target_c
 DNI_MAYOR_18  = 48_000_000      # DNI < este → mayor de 18 en 2026
 DNI_EXTRANJERO = 90_000_000     # DNI >= este → extranjero, se excluye
 OUTPUT        = "dataset_ews.parquet"
+FILAS_POR_BLOQUE = 500_000      # filas acumuladas antes de escribir al parquet
 
 # ── clasificación de entidades ──────────────────────────────────────────────────
 BANCOS_PUBLICOS = {
@@ -95,6 +107,16 @@ def tipo_entidad(cod_str):
         return "financiera"
     return "prov_nofinanciero"
 
+# tipos como bits para guardarlos en un entero por CUIT × mes
+BIT_TIPO = {
+    "banco_publico":     1,
+    "banco_privado":     2,
+    "banco_digital":     4,
+    "financiera":        8,
+    "billetera":         16,
+    "prov_nofinanciero": 32,
+}
+
 
 # ── mapeo índice → período AAAAMM ──────────────────────────────────────────────
 # idx 0 = más reciente (BASE_PERIODO), idx 23 = más antiguo
@@ -109,19 +131,16 @@ def idx_a_periodo(base, idx):
 PERIODOS = [idx_a_periodo(BASE_PERIODO, i) for i in range(24)]
 
 
-# ── parser de línea 24DSF ───────────────────────────────────────────────────────
-def parsear(line):
+# ── parser de meses 24DSF ───────────────────────────────────────────────────────
+def parsear_meses(line):
     """
     Estructura: 5 entidad | 2 tipo_id | 11 CUIT | 24 × (2 sit + 12 monto + 1 judicial)
-    Total mínimo: 378 chars.
-    Retorna (entidad, cuit, meses) donde meses[i] = (sit, monto_miles, judicial)
+    Retorna tres arrays (sits, montos, juds) de 24 posiciones.
     i=0 → mes más reciente, i=23 → más antiguo.
     """
-    if len(line) < 378:
-        return None
-    entidad = line[0:5].strip()
-    cuit    = line[7:18]
-    meses   = []
+    sits   = array("b", bytes(24))
+    montos = array("d", bytes(24 * 8))
+    juds   = array("b", bytes(24))
     for i in range(24):
         p = 18 + i * 15
         s_str = line[p:p+2].strip()
@@ -133,8 +152,8 @@ def parsear(line):
             j = int(j_str)   if j_str else 0
         except ValueError:
             s, m, j = 0, 0.0, 0
-        meses.append((s, m, j))
-    return entidad, cuit, meses
+        sits[i], montos[i], juds[i] = s, m, j
+    return sits, montos, juds
 
 
 # ── filtro persona física mayor de edad ────────────────────────────────────────
@@ -171,26 +190,71 @@ def demograficos(cuit):
 
 
 # ── helpers de acceso a meses ──────────────────────────────────────────────────
-def sit(meses, idx):
-    return meses[idx][0] if 0 <= idx < len(meses) else 0
+def get(arr, idx, default):
+    return arr[idx] if 0 <= idx < 24 else default
 
-def monto(meses, idx):
-    return meses[idx][1] if 0 <= idx < len(meses) else 0.0
-
-def jud(meses, idx):
-    return meses[idx][2] if 0 <= idx < len(meses) else 0
-
-def meses_consec_normal(meses, desde_idx):
+def meses_consec_normal(sits, desde_idx):
     """Meses consecutivos con sit=1 desde desde_idx hacia el pasado."""
     c, i = 0, desde_idx
-    while i < len(meses) and meses[i][0] == 1:
+    while i < 24 and sits[i] == 1:
         c += 1
         i += 1
     return c
 
-def meses_con_deuda(meses, desde_idx):
+def meses_con_deuda(sits, desde_idx):
     """Meses con sit > 0 desde desde_idx hacia el pasado."""
-    return sum(1 for i in range(desde_idx, len(meses)) if meses[i][0] > 0)
+    return sum(1 for i in range(desde_idx, 24) if sits[i] > 0)
+
+
+# ── acumulador de otras entidades por CUIT ─────────────────────────────────────
+# agg[k*24 + idx] para cada campo k:
+F_N, F_PEOR, F_N2, F_N3P, F_JUD, F_TIPOS = range(6)
+
+def nuevo_acumulador():
+    # array de enteros (6 campos × 24 meses) + array de montos (24 meses)
+    return array("i", bytes(6 * 24 * 4)), array("d", bytes(24 * 8))
+
+
+# ── esquema de salida ──────────────────────────────────────────────────────────
+SCHEMA = pa.schema([
+    ("cuit",                      pa.string()),
+    ("periodo",                   pa.int32()),
+    ("sit_sant_t",                pa.int8()),
+    ("sit_sant_t1",               pa.int8()),
+    ("sit_sant_t2",               pa.int8()),
+    ("sit_sant_t3",               pa.int8()),
+    ("monto_sant_t",              pa.float32()),
+    ("monto_sant_t3",             pa.float32()),
+    ("var_monto_3m_sant",         pa.float32()),
+    ("log_monto_sant",            pa.float32()),
+    ("meses_consec_normal_sant",  pa.int8()),
+    ("meses_con_deuda_sant",      pa.int8()),
+    ("judicial_sant_t",           pa.int8()),
+    ("n_entidades_otras_t",       pa.int8()),
+    ("peor_sit_otras_t",          pa.int8()),
+    ("n_ent_sit2_otras_t",        pa.int8()),
+    ("n_ent_sit3plus_otras_t",    pa.int8()),
+    ("monto_otras_t",             pa.float32()),
+    ("log_monto_otras",           pa.float32()),
+    ("tiene_judicial_otras_t",    pa.int8()),
+    ("otras_tiene_banco_publico", pa.int8()),
+    ("otras_tiene_banco_privado", pa.int8()),
+    ("otras_tiene_banco_digital", pa.int8()),
+    ("otras_tiene_financiera",    pa.int8()),
+    ("otras_tiene_billetera",     pa.int8()),
+    ("otras_tiene_prov_nofin",    pa.int8()),
+    ("otras_n_tipos_entidad",     pa.int8()),
+    ("tiene_deuda_otras",         pa.int8()),
+    ("n_entidades_total_t",       pa.int8()),
+    ("peor_sit_sistema_t",        pa.int8()),
+    ("meses_con_deuda_sistema",   pa.int8()),
+    ("left_censored",             pa.int8()),
+    ("sexo_proxy",                pa.string()),
+    ("rango_edad_proxy",          pa.string()),
+    ("target_a",                  pa.float32()),   # float para admitir None
+    ("target_c",                  pa.float32()),
+])
+COLS = SCHEMA.names
 
 
 # ── main ────────────────────────────────────────────────────────────────────────
@@ -210,93 +274,113 @@ def main():
 
     # ── PASADA 1: identificar CUITs elegibles de Santander ─────────────────────
     print("[1] Pasada 1 — CUITs de Santander con prefiltro...")
-    sant = {}   # cuit → lista de 24 tuplas (sit, monto, judicial)
+    sant = {}   # cuit → (sits, montos, juds)
     n = 0
     with open(ARCHIVO_24DSF, encoding="latin-1") as f:
         for line in f:
             n += 1
             if n % 5_000_000 == 0:
                 print(f"  {n/1e6:.0f}M líneas | {len(sant):,} CUITs elegibles")
-            r = parsear(line.rstrip("\r\n"))
-            if not r:
+            line = line.rstrip("\r\n")
+            if len(line) < 378:
                 continue
-            entidad, cuit, meses = r
-            if entidad != ENTIDAD_FOCAL:
+            if line[0:5].strip() != ENTIDAD_FOCAL:
                 continue
+            cuit = line[7:18]
             if not es_elegible(cuit):
                 continue
-            if any(m[0] > 0 for m in meses):
+            meses = parsear_meses(line)
+            if any(s > 0 for s in meses[0]):
                 sant[cuit] = meses
 
     print(f"\n  Total líneas   : {n:,}")
     print(f"  CUITs elegibles: {len(sant):,}")
 
     # ── PASADA 2: acumular otras entidades para esos CUITs ─────────────────────
-    # Para cada CUIT × mes guardamos un acumulador con lo necesario para
-    # calcular las features de otras entidades al final, sin guardar los
-    # meses crudos de cada entidad.
-    #
-    # otras[cuit][idx] = {
-    #   "sits":   [sit_ent1, sit_ent2, ...],   ← para peor_sit, n_sit2, n_sit3+
-    #   "montos": [monto_ent1, ...],
-    #   "juds":   [jud_ent1, ...],
-    #   "tipos":  set(tipo_ent1, tipo_ent2, ...) ← para dummies de tipo
-    # }
+    # otras[cuit] = (agg, montos_sum); se crea solo si el CUIT tiene deuda en
+    # alguna otra entidad. Ver F_* para el layout de agg.
     print(f"\n[2] Pasada 2 — acumulando otras entidades para {len(sant):,} CUITs...")
-    otras = {cuit: [{"sits": [], "montos": [], "juds": [], "tipos": set()}
-                    for _ in range(24)]
-             for cuit in sant}
+    otras = {}
     n = 0
     with open(ARCHIVO_24DSF, encoding="latin-1") as f:
         for line in f:
             n += 1
             if n % 5_000_000 == 0:
-                print(f"  {n/1e6:.0f}M líneas")
-            r = parsear(line.rstrip("\r\n"))
-            if not r:
+                print(f"  {n/1e6:.0f}M líneas | {len(otras):,} CUITs con otras entidades")
+            line = line.rstrip("\r\n")
+            if len(line) < 378:
                 continue
-            entidad, cuit, meses = r
-            if entidad == ENTIDAD_FOCAL or cuit not in sant:
+            cuit = line[7:18]
+            if cuit not in sant:
                 continue
-            t = tipo_entidad(entidad)
+            entidad = line[0:5].strip()
+            if entidad == ENTIDAD_FOCAL:
+                continue
+            bit = BIT_TIPO[tipo_entidad(entidad)]
+            sits, montos, juds = parsear_meses(line)
+            acc = None
             for idx in range(24):
-                s = meses[idx][0]
+                s = sits[idx]
                 if s == 0:
                     continue   # sin deuda en este mes, no aporta
-                otras[cuit][idx]["sits"].append(s)
-                otras[cuit][idx]["montos"].append(meses[idx][1])
-                otras[cuit][idx]["juds"].append(meses[idx][2])
-                otras[cuit][idx]["tipos"].add(t)
+                if acc is None:
+                    acc = otras.get(cuit)
+                    if acc is None:
+                        acc = otras[cuit] = nuevo_acumulador()
+                agg, msum = acc
+                if agg[F_N * 24 + idx] == 0 or s > agg[F_PEOR * 24 + idx]:
+                    agg[F_PEOR * 24 + idx] = s
+                agg[F_N * 24 + idx] += 1
+                if s == 2:
+                    agg[F_N2 * 24 + idx] += 1
+                elif s >= 3:
+                    agg[F_N3P * 24 + idx] += 1
+                if juds[idx] > 0:
+                    agg[F_JUD * 24 + idx] = 1
+                agg[F_TIPOS * 24 + idx] |= bit
+                msum[idx] += montos[idx]
 
-    print(f"  Pasada 2 completa.")
+    print(f"  Pasada 2 completa. {len(otras):,} CUITs con deuda en otras entidades.")
 
     # ── CONSTRUCCIÓN DEL DATASET ────────────────────────────────────────────────
     print("\n[3] Construyendo features y targets...")
 
-    rows = []
+    tmp_output = OUTPUT + ".tmp"
+    writer = pq.ParquetWriter(tmp_output, SCHEMA, compression="snappy")
+    bloque = {col: [] for col in COLS}
+    filas_bloque = 0
+
+    def volcar():
+        nonlocal bloque, filas_bloque
+        if filas_bloque:
+            writer.write_table(pa.table(bloque, schema=SCHEMA))
+            bloque = {col: [] for col in COLS}
+            filas_bloque = 0
+
+    vacio = nuevo_acumulador()   # para CUITs sin otras entidades
     n_obs = n_valida_a = n_valida_c = n_pos_a = n_pos_c = 0
 
-    for cuit, s_meses in sant.items():
+    for cuit, (s_sits, s_montos, s_juds) in sant.items():
         sexo, rango = demograficos(cuit)
-        o_meses = otras[cuit]   # lista de 24 acumuladores
+        agg, msum = otras.get(cuit, vacio)
+
+        def n_o(i):    return agg[F_N * 24 + i]
+        def peor_o(i): return agg[F_PEOR * 24 + i] if agg[F_N * 24 + i] else 0
 
         # censura por la izquierda: ya estaba en el mes más antiguo (idx=23)
-        en_sant_mes23  = sit(s_meses, 23) > 0
-        en_otras_mes23 = len(o_meses[23]["sits"]) > 0
-        left_censored  = int(en_sant_mes23 or en_otras_mes23)
+        left_censored = int(s_sits[23] > 0 or n_o(23) > 0)
 
         for idx in range(24):
             # sin deuda en Santander este mes → no hay observación
-            s_sant = sit(s_meses, idx)
+            s_sant = s_sits[idx]
             if s_sant == 0:
                 continue
 
-            # peor situación en otras entidades en t
-            sits_o  = o_meses[idx]["sits"]
-            peor_o  = max(sits_o) if sits_o else 0
+            n_otras = n_o(idx)
+            peor_ot = peor_o(idx)
 
             # peor situación en TODO el sistema (Santander + otras)
-            peor_sistema = max(s_sant, peor_o)
+            peor_sistema = max(s_sant, peor_ot)
 
             # condición de entrada por target
             valida_a = (peor_sistema == 1 and idx >= HORIZON_A)
@@ -310,9 +394,10 @@ def main():
             # ── targets ───────────────────────────────────────────────────────
             # futuro = índices menores (idx-1, idx-2, ...)
             def peor_en(i):
-                ss = sit(s_meses, i)
-                so = o_meses[i]["sits"]
-                return max([ss] + so) if (ss > 0 or so) else 0
+                ss = s_sits[i]
+                if n_o(i):
+                    return max(ss, peor_o(i))
+                return ss if ss > 0 else 0
 
             ta = tc = None
             if valida_a:
@@ -325,81 +410,78 @@ def main():
                 n_pos_c    += tc
 
             # ── features Santander ────────────────────────────────────────────
-            monto_t  = monto(s_meses, idx)
-            monto_t3 = monto(s_meses, idx + 3)
+            monto_t  = s_montos[idx]
+            monto_t3 = get(s_montos, idx + 3, 0.0)
             var_monto_3m = round((monto_t - monto_t3) / monto_t3 * 100, 2) \
                            if monto_t3 > 0 else None
 
             # ── features otras entidades ──────────────────────────────────────
-            montos_o = o_meses[idx]["montos"]
-            juds_o   = o_meses[idx]["juds"]
-            tipos_o  = o_meses[idx]["tipos"]
-
-            n_otras      = len(sits_o)
-            n_sit2_o     = sum(1 for s in sits_o if s == 2)
-            n_sit3plus_o = sum(1 for s in sits_o if s >= 3)
-            monto_otras  = sum(montos_o)
+            tipos_o      = agg[F_TIPOS * 24 + idx]
+            monto_otras  = msum[idx]
             log_monto_o  = round(math.log1p(monto_otras), 4) if monto_otras > 0 else 0.0
 
             # ── features sistema total ────────────────────────────────────────
-            # n entidades total = Santander (siempre 1) + otras activas
             n_total = 1 + n_otras
 
-            # meses con deuda en sistema (desde idx hacia atrás)
-            meses_deuda_sant = meses_con_deuda(s_meses, idx)
+            meses_deuda_sant = meses_con_deuda(s_sits, idx)
             meses_deuda_sis  = meses_deuda_sant + sum(
-                1 for i in range(idx, 24)
-                if len(o_meses[i]["sits"]) > 0
+                1 for i in range(idx, 24) if n_o(i) > 0
             )
 
-            # log monto Santander
             log_monto_s = round(math.log1p(monto_t), 4) if monto_t > 0 else 0.0
 
-            row = {
-                "cuit":                      cuit,
-                "periodo":                   PERIODOS[idx],
+            valores = (
+                cuit,
+                PERIODOS[idx],
                 # ── Santander ──
-                "sit_sant_t":                s_sant,
-                "sit_sant_t1":               sit(s_meses, idx + 1),
-                "sit_sant_t2":               sit(s_meses, idx + 2),
-                "sit_sant_t3":               sit(s_meses, idx + 3),
-                "monto_sant_t":              round(monto_t, 1),
-                "monto_sant_t3":             round(monto_t3, 1),
-                "var_monto_3m_sant":         var_monto_3m,
-                "log_monto_sant":            log_monto_s,
-                "meses_consec_normal_sant":  meses_consec_normal(s_meses, idx),
-                "meses_con_deuda_sant":      meses_deuda_sant,
-                "judicial_sant_t":           jud(s_meses, idx),
+                s_sant,
+                get(s_sits, idx + 1, 0),
+                get(s_sits, idx + 2, 0),
+                get(s_sits, idx + 3, 0),
+                round(monto_t, 1),
+                round(monto_t3, 1),
+                var_monto_3m,
+                log_monto_s,
+                meses_consec_normal(s_sits, idx),
+                meses_deuda_sant,
+                s_juds[idx],
                 # ── otras entidades ──
-                "n_entidades_otras_t":       n_otras,
-                "peor_sit_otras_t":          peor_o,
-                "n_ent_sit2_otras_t":        n_sit2_o,
-                "n_ent_sit3plus_otras_t":    n_sit3plus_o,
-                "monto_otras_t":             round(monto_otras, 1),
-                "log_monto_otras":           log_monto_o,
-                "tiene_judicial_otras_t":    int(any(j > 0 for j in juds_o)),
-                "otras_tiene_banco_publico": int("banco_publico"    in tipos_o),
-                "otras_tiene_banco_privado": int("banco_privado"    in tipos_o),
-                "otras_tiene_banco_digital": int("banco_digital"    in tipos_o),
-                "otras_tiene_financiera":    int("financiera"       in tipos_o),
-                "otras_tiene_billetera":     int("billetera"        in tipos_o),
-                "otras_tiene_prov_nofin":    int("prov_nofinanciero" in tipos_o),
-                "otras_n_tipos_entidad":     len(tipos_o),
-                "tiene_deuda_otras":         int(n_otras > 0),
+                n_otras,
+                peor_ot,
+                agg[F_N2 * 24 + idx],
+                agg[F_N3P * 24 + idx],
+                round(monto_otras, 1),
+                log_monto_o,
+                agg[F_JUD * 24 + idx],
+                int(bool(tipos_o & BIT_TIPO["banco_publico"])),
+                int(bool(tipos_o & BIT_TIPO["banco_privado"])),
+                int(bool(tipos_o & BIT_TIPO["banco_digital"])),
+                int(bool(tipos_o & BIT_TIPO["financiera"])),
+                int(bool(tipos_o & BIT_TIPO["billetera"])),
+                int(bool(tipos_o & BIT_TIPO["prov_nofinanciero"])),
+                bin(tipos_o).count("1"),
+                int(n_otras > 0),
                 # ── sistema total ──
-                "n_entidades_total_t":       n_total,
-                "peor_sit_sistema_t":        peor_sistema,
-                "meses_con_deuda_sistema":   meses_deuda_sis,
+                n_total,
+                peor_sistema,
+                meses_deuda_sis,
                 # ── antigüedad ──
-                "left_censored":             left_censored,
+                left_censored,
                 # ── demografía ──
-                "sexo_proxy":                sexo,
-                "rango_edad_proxy":          rango,
+                sexo,
+                rango,
                 # ── targets ──
-                "target_a":                  ta,
-                "target_c":                  tc,
-            }
-            rows.append(row)
+                ta,
+                tc,
+            )
+            for col, v in zip(COLS, valores):
+                bloque[col].append(v)
+            filas_bloque += 1
+            if filas_bloque >= FILAS_POR_BLOQUE:
+                volcar()
+
+    volcar()
+    writer.close()
 
     print(f"  Observaciones totales  : {n_obs:,}")
     print(f"  Válidas target A       : {n_valida_a:,}  | positivos: {n_pos_a:,} ({n_pos_a/n_valida_a*100:.1f}%)" if n_valida_a else "  Target A: sin obs")
@@ -407,56 +489,10 @@ def main():
 
     # ── guardar parquet ────────────────────────────────────────────────────────
     print(f"\n[4] Guardando {OUTPUT}...")
-
-    # construir tabla columna por columna
-    cols = list(rows[0].keys())
-    data = {col: [r[col] for r in rows] for col in cols}
-
-    # tipos explícitos para columnas críticas
-    schema = pa.schema([
-        ("cuit",                      pa.string()),
-        ("periodo",                   pa.int32()),
-        ("sit_sant_t",                pa.int8()),
-        ("sit_sant_t1",               pa.int8()),
-        ("sit_sant_t2",               pa.int8()),
-        ("sit_sant_t3",               pa.int8()),
-        ("monto_sant_t",              pa.float32()),
-        ("monto_sant_t3",             pa.float32()),
-        ("var_monto_3m_sant",         pa.float32()),
-        ("log_monto_sant",            pa.float32()),
-        ("meses_consec_normal_sant",  pa.int8()),
-        ("meses_con_deuda_sant",      pa.int8()),
-        ("judicial_sant_t",           pa.int8()),
-        ("n_entidades_otras_t",       pa.int8()),
-        ("peor_sit_otras_t",          pa.int8()),
-        ("n_ent_sit2_otras_t",        pa.int8()),
-        ("n_ent_sit3plus_otras_t",    pa.int8()),
-        ("monto_otras_t",             pa.float32()),
-        ("log_monto_otras",           pa.float32()),
-        ("tiene_judicial_otras_t",    pa.int8()),
-        ("otras_tiene_banco_publico", pa.int8()),
-        ("otras_tiene_banco_privado", pa.int8()),
-        ("otras_tiene_banco_digital", pa.int8()),
-        ("otras_tiene_financiera",    pa.int8()),
-        ("otras_tiene_billetera",     pa.int8()),
-        ("otras_tiene_prov_nofin",    pa.int8()),
-        ("otras_n_tipos_entidad",     pa.int8()),
-        ("tiene_deuda_otras",         pa.int8()),
-        ("n_entidades_total_t",       pa.int8()),
-        ("peor_sit_sistema_t",        pa.int8()),
-        ("meses_con_deuda_sistema",   pa.int8()),
-        ("left_censored",             pa.int8()),
-        ("sexo_proxy",                pa.string()),
-        ("rango_edad_proxy",          pa.string()),
-        ("target_a",                  pa.float32()),   # float para admitir None
-        ("target_c",                  pa.float32()),
-    ])
-
-    tabla = pa.table(data, schema=schema)
-    pq.write_table(tabla, OUTPUT, compression="snappy")
+    os.replace(tmp_output, OUTPUT)
 
     tam = os.path.getsize(OUTPUT) / 1024**2
-    print(f"  {OUTPUT}: {tam:.1f} MB | {len(rows):,} filas | {len(cols)} columnas")
+    print(f"  {OUTPUT}: {tam:.1f} MB | {n_obs:,} filas | {len(COLS)} columnas")
     print(f"\nListo. Siguiente paso: python 03_split.py")
 
 
