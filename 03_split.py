@@ -17,15 +17,23 @@ el modelo base — en pipeline_v2 se entrenó dos veces (con y sin macro) justam
 el análisis de PSI mostró inestabilidad temporal fuerte en esas variables. Dejarlas acá
 simplemente te da la opción de repetir esa comparación con la data de agosto 2026.
 
+Memoria: el dataset tiene ~32M filas y el macro ~48 columnas, así que mergear todo en
+memoria no entra en 16GB. Por eso el split se decide leyendo solo cuit + target_c, y
+después el parquet se recorre por row group: a cada bloque se le pega el macro y se
+escribe en train o test. El resultado es el mismo que hacer todo en memoria.
+
 Uso: python 03_split.py
 Requiere: pandas, pyarrow
 """
 
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ── paths (independientes del directorio desde donde se ejecute) ──────────────────
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -39,38 +47,49 @@ TEST_SIZE     = 0.20     # proporción de CUITs que van a test
 RANDOM_STATE  = 42        # fijo para reproducibilidad
 
 
-def merge_macro(df: pd.DataFrame) -> pd.DataFrame:
+def cargar_macro(periodos: np.ndarray):
+    """
+    Devuelve (macro, dtypes) o (None, None) si no hay macro_bcra.csv.
+    dtypes son los tipos que tendría el merge sobre el dataset completo (por ejemplo,
+    una columna entera pasa a float si algún período queda sin macro); se aplican a
+    cada bloque para que todos se escriban con el mismo esquema.
+    """
     if not MACRO_CSV.exists():
         print(f"  AVISO: no se encontró {MACRO_CSV.name} — se continúa sin columnas macro.")
         print(f"         (correr primero 01_descargar_macro_bcra.py si las querés incluir)")
-        return df
+        return None, None
 
     macro = pd.read_csv(MACRO_CSV, sep=";")
     macro = macro.rename(columns={"periodo_aaaamm": "periodo"})
     macro = macro.drop(columns=["fecha_bcra"], errors="ignore")
 
+    por_periodo = pd.DataFrame({"periodo": periodos}).merge(macro, on="periodo", how="left")
+    assert len(por_periodo) == len(periodos), \
+        "el merge con macro no debería cambiar la cantidad de filas"
+
+    print(f"  Macro: +{len(macro.columns) - 1} columnas.")
+    return macro, por_periodo.dtypes
+
+
+def merge_macro(df: pd.DataFrame, macro, dtypes) -> pd.DataFrame:
+    if macro is None:
+        return df
     antes = len(df)
     df = df.merge(macro, on="periodo", how="left")
     assert len(df) == antes, "el merge con macro no debería cambiar la cantidad de filas"
-
-    sin_macro = df[macro.columns.drop("periodo")].isna().all(axis=1).sum()
-    if sin_macro:
-        print(f"  AVISO: {sin_macro:,} filas quedaron sin datos macro "
-              f"(período fuera del rango de macro_bcra.csv).")
-    print(f"  Macro mergeado: +{len(macro.columns) - 1} columnas.")
-    return df
+    return df.astype(dtypes.to_dict())
 
 
-def split_por_cuit(df: pd.DataFrame, test_size: float, seed: int):
+def elegir_cuits_test(ids: pd.DataFrame, test_size: float, seed: int) -> set:
     """
     Split a nivel CUIT (no fila), estratificado por 'alguna vez target_c == 1'.
-    Devuelve (df_train, df_test).
+    Recibe solo las columnas cuit y target_c; devuelve el set de CUITs de test.
     """
     rng = np.random.default_rng(seed)
 
     # flag por CUIT: ¿tuvo target_c=1 en algún período?
     cuit_flag = (
-        df.groupby("cuit")["target_c"]
+        ids.groupby("cuit")["target_c"]
         .max()
         .fillna(0)
         .gt(0)
@@ -88,16 +107,11 @@ def split_por_cuit(df: pd.DataFrame, test_size: float, seed: int):
 
     test_cuits = elegir_test(cuits_pos) | elegir_test(cuits_neg)
 
-    es_test = df["cuit"].isin(test_cuits)
-    df_train = df.loc[~es_test].reset_index(drop=True)
-    df_test  = df.loc[es_test].reset_index(drop=True)
-
     print(f"  CUITs totales      : {len(cuit_flag):,} "
           f"({len(cuits_pos):,} con target_c=1 alguna vez, {len(cuits_neg):,} sin)")
     print(f"  CUITs en test      : {len(test_cuits):,} ({len(test_cuits)/len(cuit_flag)*100:.1f}%)")
-    print(f"  Filas train / test : {len(df_train):,} / {len(df_test):,}")
 
-    return df_train, df_test
+    return test_cuits
 
 
 def main():
@@ -110,19 +124,50 @@ def main():
         print("Corré primero 02_construir_dataset.py")
         sys.exit(1)
 
-    print(f"\n[1] Cargando {DATASET_EWS.name}...")
-    df = pd.read_parquet(DATASET_EWS)
-    print(f"  {len(df):,} filas, {df['cuit'].nunique():,} CUITs")
+    print(f"\n[1] Cargando cuit / target_c de {DATASET_EWS.name}...")
+    ids = pd.read_parquet(DATASET_EWS, columns=["cuit", "periodo", "target_c"])
+    print(f"  {len(ids):,} filas, {ids['cuit'].nunique():,} CUITs")
+    periodos = ids["periodo"].unique()
 
-    print(f"\n[2] Merge con macro...")
-    df = merge_macro(df)
+    print(f"\n[2] Macro...")
+    macro, dtypes = cargar_macro(periodos)
 
     print(f"\n[3] Split train/test a nivel CUIT (test_size={TEST_SIZE}, seed={RANDOM_STATE})...")
-    df_train, df_test = split_por_cuit(df, TEST_SIZE, RANDOM_STATE)
+    test_cuits = elegir_cuits_test(ids, TEST_SIZE, RANDOM_STATE)
+    del ids
 
-    print(f"\n[4] Guardando...")
-    df_train.to_parquet(OUT_TRAIN, compression="snappy", index=False)
-    df_test.to_parquet(OUT_TEST, compression="snappy", index=False)
+    print(f"\n[4] Mergeando macro y guardando por bloques...")
+    pf = pq.ParquetFile(DATASET_EWS)
+    tmp = {OUT_TRAIN: OUT_TRAIN.with_name(OUT_TRAIN.name + ".tmp"),
+           OUT_TEST:  OUT_TEST.with_name(OUT_TEST.name + ".tmp")}
+    writers = {}
+    filas = {OUT_TRAIN: 0, OUT_TEST: 0}
+    sin_macro = 0
+
+    for i in range(pf.num_row_groups):
+        df = merge_macro(pf.read_row_group(i).to_pandas(), macro, dtypes)
+        if macro is not None:
+            sin_macro += df[macro.columns.drop("periodo")].isna().all(axis=1).sum()
+
+        es_test = df["cuit"].isin(test_cuits)
+        for out, parte in ((OUT_TRAIN, df.loc[~es_test]), (OUT_TEST, df.loc[es_test])):
+            if parte.empty:
+                continue
+            tabla = pa.Table.from_pandas(parte, preserve_index=False)
+            if out not in writers:
+                writers[out] = pq.ParquetWriter(tmp[out], tabla.schema, compression="snappy")
+            writers[out].write_table(tabla)
+            filas[out] += len(parte)
+
+    for w in writers.values():
+        w.close()
+    for out in writers:
+        os.replace(tmp[out], out)
+
+    if sin_macro:
+        print(f"  AVISO: {sin_macro:,} filas quedaron sin datos macro "
+              f"(período fuera del rango de macro_bcra.csv).")
+    print(f"  Filas train / test : {filas[OUT_TRAIN]:,} / {filas[OUT_TEST]:,}")
     print(f"  {OUT_TRAIN.name}: {OUT_TRAIN.stat().st_size / 1024**2:.1f} MB")
     print(f"  {OUT_TEST.name}: {OUT_TEST.stat().st_size / 1024**2:.1f} MB")
 
