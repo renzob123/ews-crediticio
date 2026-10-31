@@ -21,9 +21,9 @@ Features principales:
   Santander:
     - sit_sant_t, sit_sant_t1, sit_sant_t2, sit_sant_t3
     - monto_sant_t, monto_sant_t3, var_monto_3m_sant
-    - meses_consec_normal_sant (rachas sit=1 hacia atrás)
+    - meses_consec_normal_sant_6m (racha sit=1 hacia atrás, tope 6)
     - judicial_sant_t
-    - meses_con_deuda_sant
+    - meses_con_deuda_sant_3m / _6m
 
   Otras entidades (excluye Santander):
     - n_entidades_otras_t        (cuántas otras entidades tiene activas)
@@ -38,14 +38,20 @@ Features principales:
   Sistema total (Santander + otras):
     - n_entidades_total_t        (todas las entidades incluyendo Santander)
     - peor_sit_sistema_t         (peor sit en todo el sistema)
-    - meses_con_deuda_sistema
+    - meses_con_deuda_sistema_3m / _6m (meses con deuda en cualquier entidad)
 
   Demografía (derivada del CUIT):
     - sexo_proxy (M/F/I)
     - rango_edad_proxy
 
   Antigüedad:
-    - left_censored (ya estaba en el mes más antiguo del archivo)
+    - deuda_sistema_t5 (ya tenía deuda en el sistema 5 meses antes, al inicio
+      de la ventana de 6 meses)
+
+Historia mínima: las features miran como mucho HISTORIA_MIN meses (t, t-1, ...,
+t-5). Solo se generan filas para los períodos que tienen esa historia completa
+dentro del archivo, así las features significan lo mismo en todas las filas y
+en producción (donde siempre se predice con el mes más reciente).
 
 Uso: python 02_construir_dataset.py
 Tiempo estimado: ~20 min (dos pasadas sobre ~22GB), ~4GB de RAM
@@ -75,6 +81,8 @@ BASE_PERIODO  = 202608          # AAAAMM del mes índice 0 (más reciente)
 ENTIDAD_FOCAL = "72"            # Santander Argentina
 HORIZON_A     = 3               # meses a futuro para target_a
 HORIZON_C     = 12              # meses a futuro para target_c
+HISTORIA_MIN  = 6               # meses de historia (t incluido) que usan las features
+VENTANA_CORTA = 3               # ventana corta de los conteos de meses con deuda
 DNI_MAYOR_18  = 48_000_000      # DNI < este → mayor de 18 en 2026
 DNI_EXTRANJERO = 90_000_000     # DNI >= este → extranjero, se excluye
 OUTPUT        = "dataset_ews.parquet"
@@ -193,17 +201,17 @@ def demograficos(cuit):
 def get(arr, idx, default):
     return arr[idx] if 0 <= idx < 24 else default
 
-def meses_consec_normal(sits, desde_idx):
-    """Meses consecutivos con sit=1 desde desde_idx hacia el pasado."""
+def meses_consec_normal(sits, desde_idx, tope):
+    """Meses consecutivos con sit=1 desde desde_idx hacia el pasado, hasta tope."""
     c, i = 0, desde_idx
-    while i < 24 and sits[i] == 1:
+    while c < tope and sits[i] == 1:
         c += 1
         i += 1
     return c
 
-def meses_con_deuda(sits, desde_idx):
-    """Meses con sit > 0 desde desde_idx hacia el pasado."""
-    return sum(1 for i in range(desde_idx, 24) if sits[i] > 0)
+def meses_con_deuda(con_deuda, desde_idx, ventana):
+    """Meses con deuda en los `ventana` meses que terminan en desde_idx (incluido)."""
+    return sum(1 for i in range(desde_idx, desde_idx + ventana) if con_deuda(i))
 
 
 # ── acumulador de otras entidades por CUIT ─────────────────────────────────────
@@ -227,8 +235,9 @@ SCHEMA = pa.schema([
     ("monto_sant_t3",             pa.float32()),
     ("var_monto_3m_sant",         pa.float32()),
     ("log_monto_sant",            pa.float32()),
-    ("meses_consec_normal_sant",  pa.int8()),
-    ("meses_con_deuda_sant",      pa.int8()),
+    ("meses_consec_normal_sant_6m", pa.int8()),
+    ("meses_con_deuda_sant_3m",   pa.int8()),
+    ("meses_con_deuda_sant_6m",   pa.int8()),
     ("judicial_sant_t",           pa.int8()),
     ("n_entidades_otras_t",       pa.int8()),
     ("peor_sit_otras_t",          pa.int8()),
@@ -247,8 +256,9 @@ SCHEMA = pa.schema([
     ("tiene_deuda_otras",         pa.int8()),
     ("n_entidades_total_t",       pa.int8()),
     ("peor_sit_sistema_t",        pa.int8()),
-    ("meses_con_deuda_sistema",   pa.int8()),
-    ("left_censored",             pa.int8()),
+    ("meses_con_deuda_sistema_3m", pa.int8()),
+    ("meses_con_deuda_sistema_6m", pa.int8()),
+    ("deuda_sistema_t5",          pa.int8()),
     ("sexo_proxy",                pa.string()),
     ("rango_edad_proxy",          pa.string()),
     ("target_a",                  pa.float32()),   # float para admitir None
@@ -266,6 +276,7 @@ def main():
     print(f"  Base período: {BASE_PERIODO}  ({PERIODOS[23]} → {PERIODOS[0]})")
     print(f"  Target A   : caída a sit>=2 en {HORIZON_A} meses")
     print(f"  Target C   : caída a sit>=3 en {HORIZON_C} meses")
+    print(f"  Historia   : {HISTORIA_MIN} meses (filas desde {PERIODOS[24 - HISTORIA_MIN]})")
     print()
 
     if not os.path.exists(ARCHIVO_24DSF):
@@ -366,11 +377,11 @@ def main():
 
         def n_o(i):    return agg[F_N * 24 + i]
         def peor_o(i): return agg[F_PEOR * 24 + i] if agg[F_N * 24 + i] else 0
+        def deuda_sant(i):    return s_sits[i] > 0
+        def deuda_sistema(i): return s_sits[i] > 0 or n_o(i) > 0
 
-        # censura por la izquierda: ya estaba en el mes más antiguo (idx=23)
-        left_censored = int(s_sits[23] > 0 or n_o(23) > 0)
-
-        for idx in range(24):
+        # solo períodos con HISTORIA_MIN meses de historia dentro del archivo
+        for idx in range(24 - HISTORIA_MIN + 1):
             # sin deuda en Santander este mes → no hay observación
             s_sant = s_sits[idx]
             if s_sant == 0:
@@ -423,11 +434,6 @@ def main():
             # ── features sistema total ────────────────────────────────────────
             n_total = 1 + n_otras
 
-            meses_deuda_sant = meses_con_deuda(s_sits, idx)
-            meses_deuda_sis  = meses_deuda_sant + sum(
-                1 for i in range(idx, 24) if n_o(i) > 0
-            )
-
             log_monto_s = round(math.log1p(monto_t), 4) if monto_t > 0 else 0.0
 
             valores = (
@@ -442,8 +448,9 @@ def main():
                 round(monto_t3, 1),
                 var_monto_3m,
                 log_monto_s,
-                meses_consec_normal(s_sits, idx),
-                meses_deuda_sant,
+                meses_consec_normal(s_sits, idx, HISTORIA_MIN),
+                meses_con_deuda(deuda_sant, idx, VENTANA_CORTA),
+                meses_con_deuda(deuda_sant, idx, HISTORIA_MIN),
                 s_juds[idx],
                 # ── otras entidades ──
                 n_otras,
@@ -464,9 +471,10 @@ def main():
                 # ── sistema total ──
                 n_total,
                 peor_sistema,
-                meses_deuda_sis,
+                meses_con_deuda(deuda_sistema, idx, VENTANA_CORTA),
+                meses_con_deuda(deuda_sistema, idx, HISTORIA_MIN),
                 # ── antigüedad ──
-                left_censored,
+                int(deuda_sistema(idx + HISTORIA_MIN - 1)),
                 # ── demografía ──
                 sexo,
                 rango,
@@ -474,6 +482,7 @@ def main():
                 ta,
                 tc,
             )
+            assert len(valores) == len(COLS)
             for col, v in zip(COLS, valores):
                 bloque[col].append(v)
             filas_bloque += 1

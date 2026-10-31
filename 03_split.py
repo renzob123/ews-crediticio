@@ -11,6 +11,17 @@ Toma dataset_ews.parquet (salida de 02_construir_dataset.py) y:
      mensuales repetidas de un mismo CUIT no queden partidas entre train y test
      (fuga de información). Se estratifica por "alguna vez target_c == 1" por CUIT,
      igual que en pipeline_v2/05_split_train_test.py.
+  3. Agrega columnas de validación fuera de tiempo (oot_a, oot_c) que marcan cada fila
+     según su período como "train", "hueco" o "test" para ese target:
+       - test : los últimos OOT_MESES_TEST períodos con el target válido
+       - train: períodos cuya ventana del target termina antes del primer mes de test
+                (periodo + horizonte <= primer mes de test)
+       - hueco: el resto; no se usan, porque su respuesta depende de meses del test
+     Son NaN en las filas donde ese target no es válido.
+
+     La evaluación más conservadora combina los dos splits: entrenar con
+     dataset_train.parquet & oot == "train", evaluar con dataset_test.parquet &
+     oot == "test" (otras personas y meses posteriores).
 
 Nota: las columnas macro quedan en el dataset pero no implican que haya que usarlas en
 el modelo base — en pipeline_v2 se entrenó dos veces (con y sin macro) justamente porque
@@ -46,6 +57,14 @@ OUT_TEST      = _SCRIPT_DIR / "dataset_test.parquet"
 TEST_SIZE     = 0.20     # proporción de CUITs que van a test
 RANDOM_STATE  = 42        # fijo para reproducibilidad
 
+# validación fuera de tiempo: target → (columna, horizonte en meses)
+OOT = {
+    "target_a": ("oot_a", 3),
+    "target_c": ("oot_c", 12),
+}
+OOT_MESES_TEST = 3        # últimos períodos válidos de cada target que van a test
+OOT_CATEGORIAS = ["train", "hueco", "test"]
+
 
 def cargar_macro(periodos: np.ndarray):
     """
@@ -78,6 +97,42 @@ def merge_macro(df: pd.DataFrame, macro, dtypes) -> pd.DataFrame:
     df = df.merge(macro, on="periodo", how="left")
     assert len(df) == antes, "el merge con macro no debería cambiar la cantidad de filas"
     return df.astype(dtypes.to_dict())
+
+
+def sumar_meses(periodo: int, k: int) -> int:
+    total = (periodo // 100) * 12 + periodo % 100 - 1 + k
+    return (total // 12) * 100 + total % 12 + 1
+
+
+def etiquetas_oot(ids: pd.DataFrame) -> dict:
+    """Para cada target, devuelve {periodo: "train" | "hueco" | "test"}."""
+    etiquetas = {}
+    for target, (col, horizonte) in OOT.items():
+        validos = sorted(int(p) for p in ids.loc[ids[target].notna(), "periodo"].unique())
+        primer_test = validos[-OOT_MESES_TEST]
+        limite_train = sumar_meses(primer_test, -horizonte)
+        etiq = {p: "test" if p >= primer_test else "train" if p <= limite_train else "hueco"
+                for p in validos}
+        etiquetas[target] = etiq
+
+        por_etiqueta = {e: [p for p in validos if etiq[p] == e] for e in OOT_CATEGORIAS}
+        filas = ids["periodo"].map(etiq).where(ids[target].notna()).value_counts()
+        print(f"  {col} (horizonte {horizonte} meses):")
+        for e in OOT_CATEGORIAS:
+            ps = por_etiqueta[e]
+            rango = f"{ps[0]}-{ps[-1]} ({len(ps)} meses)" if ps else "ninguno"
+            print(f"    {e:<6}: {rango:<26} {filas.get(e, 0):>12,} filas")
+        if not por_etiqueta["train"]:
+            print(f"    AVISO: con este archivo no hay períodos de train fuera de tiempo "
+                  f"para {target} (hacen falta más meses de historia).")
+    return etiquetas
+
+
+def agregar_oot(df: pd.DataFrame, etiquetas: dict) -> pd.DataFrame:
+    for target, (col, _) in OOT.items():
+        df[col] = pd.Categorical(df["periodo"].map(etiquetas[target]).where(df[target].notna()),
+                                 categories=OOT_CATEGORIAS)
+    return df
 
 
 def elegir_cuits_test(ids: pd.DataFrame, test_size: float, seed: int) -> set:
@@ -124,8 +179,8 @@ def main():
         print("Corré primero 02_construir_dataset.py")
         sys.exit(1)
 
-    print(f"\n[1] Cargando cuit / target_c de {DATASET_EWS.name}...")
-    ids = pd.read_parquet(DATASET_EWS, columns=["cuit", "periodo", "target_c"])
+    print(f"\n[1] Cargando cuit / periodo / targets de {DATASET_EWS.name}...")
+    ids = pd.read_parquet(DATASET_EWS, columns=["cuit", "periodo", "target_a", "target_c"])
     print(f"  {len(ids):,} filas, {ids['cuit'].nunique():,} CUITs")
     periodos = ids["periodo"].unique()
 
@@ -134,9 +189,12 @@ def main():
 
     print(f"\n[3] Split train/test a nivel CUIT (test_size={TEST_SIZE}, seed={RANDOM_STATE})...")
     test_cuits = elegir_cuits_test(ids, TEST_SIZE, RANDOM_STATE)
+
+    print(f"\n[4] Validación fuera de tiempo (últimos {OOT_MESES_TEST} meses válidos a test)...")
+    etiquetas = etiquetas_oot(ids)
     del ids
 
-    print(f"\n[4] Mergeando macro y guardando por bloques...")
+    print(f"\n[5] Mergeando macro y guardando por bloques...")
     pf = pq.ParquetFile(DATASET_EWS)
     tmp = {OUT_TRAIN: OUT_TRAIN.with_name(OUT_TRAIN.name + ".tmp"),
            OUT_TEST:  OUT_TEST.with_name(OUT_TEST.name + ".tmp")}
@@ -146,6 +204,7 @@ def main():
 
     for i in range(pf.num_row_groups):
         df = merge_macro(pf.read_row_group(i).to_pandas(), macro, dtypes)
+        df = agregar_oot(df, etiquetas)
         if macro is not None:
             sin_macro += df[macro.columns.drop("periodo")].isna().all(axis=1).sum()
 
