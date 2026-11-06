@@ -560,7 +560,7 @@ def main():
     print(f"  Observaciones totales  : {n_obs:,}")
     print(f"  Válidas target A       : {n_valida_a:,}  | positivos: {n_pos_a:,} ({n_pos_a/n_valida_a*100:.1f}%)" if n_valida_a else "  Target A: sin obs")
     print(f"  Válidas target B       : {n_valida_b:,}  | positivos: {n_pos_b:,} ({n_pos_b/n_valida_b*100:.1f}%)" if n_valida_b else "  Target B: sin obs")
-    print(f"  Válidas target C       :{n_valida_c:,}  | positivos: {n_pos_c:,} ({n_pos_c/n_valida_c*100:.1f}%)" if n_valida_c else "  Target C: sin obs")
+    print(f"  Válidas target C       : {n_valida_c:,}  | positivos: {n_pos_c:,} ({n_pos_c/n_valida_c*100:.1f}%)" if n_valida_c else "  Target C: sin obs")
 
     # ── guardar parquet ────────────────────────────────────────────────────────
     print(f"\n[4] Guardando {OUTPUT}...")
