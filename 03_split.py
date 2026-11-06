@@ -11,7 +11,7 @@ Toma dataset_ews.parquet (salida de 02_construir_dataset.py) y:
      mensuales repetidas de un mismo CUIT no queden partidas entre train y test
      (fuga de información). Se estratifica por "alguna vez target_c == 1" por CUIT,
      igual que en pipeline_v2/05_split_train_test.py.
-  3. Agrega columnas de validación fuera de tiempo (oot_a, oot_c) que marcan cada fila
+  3. Agrega columnas de validación fuera de tiempo (oot_a, oot_b, oot_c) que marcan cada fila
      según su período como "train", "hueco" o "test" para ese target:
        - test : los últimos OOT_MESES_TEST períodos con el target válido
        - train: períodos cuya ventana del target termina antes del primer mes de test
@@ -60,6 +60,7 @@ RANDOM_STATE  = 42        # fijo para reproducibilidad
 # validación fuera de tiempo: target → (columna, horizonte en meses)
 OOT = {
     "target_a": ("oot_a", 3),
+    "target_b": ("oot_b", 6),
     "target_c": ("oot_c", 12),
 }
 OOT_MESES_TEST = 3        # últimos períodos válidos de cada target que van a test
@@ -180,7 +181,7 @@ def main():
         sys.exit(1)
 
     print(f"\n[1] Cargando cuit / periodo / targets de {DATASET_EWS.name}...")
-    ids = pd.read_parquet(DATASET_EWS, columns=["cuit", "periodo", "target_a", "target_c"])
+    ids = pd.read_parquet(DATASET_EWS, columns=["cuit", "periodo", *OOT])
     print(f"  {len(ids):,} filas, {ids['cuit'].nunique():,} CUITs")
     periodos = ids["periodo"].unique()
 
