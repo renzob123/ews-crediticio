@@ -2,14 +2,20 @@
 
 Sistema de alerta temprana (Early Warning System) de deterioro crediticio para
 clientes persona física de Santander Argentina (entidad 72), construido a partir
-de la Central de Deudores del BCRA (archivo 24DSF, 24 meses de historia).
+de la Central de Deudores del BCRA (archivos 24DSF de 24 meses cada uno; se pueden
+combinar varios para tener más historia).
 
 ## Targets
 
-- `target_a`: caída a situación >= 2 en cualquier entidad en los próximos 3 meses
-  (entrada: situación 1 en todo el sistema).
-- `target_c`: caída a situación >= 3 en cualquier entidad en los próximos 12 meses
-  (entrada: situación <= 2 en todo el sistema).
+| Target | Evento | Horizonte | Entrada (en t) | Rol |
+|---|---|---|---|---|
+| `target_a` | 31+ días: situación >= 2 | 3 meses | situación 1 en todo el sistema | Alerta muy temprana |
+| `target_b` | ~60+ días: situación >= 2 dos meses seguidos | 6 meses | situación 1 en todo el sistema | Principal |
+| `target_c` | 90+ días: situación >= 3 | 12 meses | situación <= 2 en todo el sistema | Horizonte regulatorio |
+
+El evento se mide en cualquier entidad del sistema. `target_b` es una
+aproximación: el 24DSF no trae días de atraso y la situación 2 cubre de 31 a 90
+días, así que "dos meses seguidos en situación >= 2" se usa como proxy de 60+.
 
 ## Pipeline
 
@@ -25,17 +31,18 @@ de la Central de Deudores del BCRA (archivo 24DSF, 24 meses de historia).
 
 - **Por persona:** train y test tienen CUITs distintos (80/20, estratificado por
   "alguna vez `target_c` = 1"). Cada CUIT entra con su historia completa.
-- **Fuera de tiempo:** las columnas `oot_a` y `oot_c` marcan cada fila como
+- **Fuera de tiempo:** las columnas `oot_a`, `oot_b` y `oot_c` marcan cada fila como
   `train`, `hueco` o `test` según su período. Test son los últimos 3 meses
   válidos del target; train, los períodos cuya ventana del target termina antes
   del test. Las filas del hueco no se usan, porque su respuesta depende de meses
   del test.
 - **Historia mínima:** las features miran como mucho 6 meses atrás y solo hay
-  filas para períodos con esos 6 meses dentro del archivo, para que signifiquen
+  filas para períodos con esos 6 meses dentro de los archivos, para que signifiquen
   lo mismo que en producción.
 
-Con un solo 24DSF (24 meses), `target_c` no tiene períodos de train fuera de
-tiempo: hacen falta más meses de historia.
+Con 12 meses de horizonte, `target_c` necesita mucha historia para tener train
+fuera de tiempo (el hueco ocupa 12 meses); con los archivos actuales no alcanza,
+así que se valida solo por persona.
 
 ## Datos
 
@@ -44,9 +51,10 @@ CUITs de personas. Para correr el pipeline:
 
 1. Descargar el 24DSF desde la
    [Central de Deudores del BCRA](https://www.bcra.gob.ar/BCRAyVos/Situacion_Crediticia.asp)
-   y descomprimirlo en esta carpeta como `24DSF.txt`.
-2. Ajustar `ARCHIVO_24DSF` y `BASE_PERIODO` en `02_construir_dataset.py` si el
-   archivo corresponde a otro mes.
+   y descomprimirlo en esta carpeta.
+2. Listar los archivos y el mes más reciente de cada uno en `ARCHIVOS_24DSF`
+   (`02_construir_dataset.py`). Los meses tienen que ser contiguos: cada archivo
+   tiene que empezar antes de que termine el siguiente más nuevo.
 3. Correr los scripts en orden.
 
 ## Requisitos

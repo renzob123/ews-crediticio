@@ -5,6 +5,10 @@ Script 02: Construcción del dataset ML desde el 24DSF
 Hace dos pasadas sobre el 24DSF y genera directamente el dataset listo
 para modelar (una fila por CUIT × período válido).
 
+Puede combinar varios 24DSF de distintos meses (ARCHIVOS_24DSF) para tener más
+historia: cada mes se toma del archivo más nuevo que lo cubre, y los archivos
+anteriores solo aportan los meses que los más nuevos ya no traen.
+
 Filtros aplicados en pasada 1 (sobre los clientes de Santander):
   - Entidad focal: 72 (Santander Argentina)
   - Persona física: prefijo CUIT 20, 23, 24 o 27
@@ -13,6 +17,10 @@ Filtros aplicados en pasada 1 (sobre los clientes de Santander):
 
 Targets:
   target_a: caída a sit >= 2 en cualquier entidad en los próximos 3 meses
+            (condición de entrada: sit = 1 en TODO el sistema en t)
+  target_b: sit >= 2 dos meses seguidos en cualquier entidad dentro de los
+            próximos 6 meses (aproxima 60+ días de atraso: el 24DSF no trae
+            días, y sit 2 cubre de 31 a 90 días)
             (condición de entrada: sit = 1 en TODO el sistema en t)
   target_c: caída a sit >= 3 en cualquier entidad en los próximos 12 meses
             (condición de entrada: sit <= 2 en TODO el sistema en t)
@@ -54,11 +62,11 @@ dentro del archivo, así las features significan lo mismo en todas las filas y
 en producción (donde siempre se predice con el mes más reciente).
 
 Uso: python 02_construir_dataset.py
-Tiempo estimado: ~20 min (dos pasadas sobre ~22GB), ~4GB de RAM
+Tiempo estimado: ~20 min por cada 24DSF (dos pasadas sobre ~22GB cada uno)
 Requiere: pyarrow (pip install pyarrow)
 
 Implementación pensada para correr en ~16GB de RAM:
-  - Pasada 1: los 24 meses de cada CUIT de Santander se guardan en arrays
+  - Pasada 1: la historia de cada CUIT de Santander se guarda en arrays
     compactos (sit / monto / judicial).
   - Pasada 2: por CUIT × mes se acumulan solo los agregados que usan las
     features (peor sit, n entidades, n sit2, n sit3+, judicial, tipos como
@@ -76,10 +84,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # ── configuración ───────────────────────────────────────────────────────────────
-ARCHIVO_24DSF = "24DSF.txt"     # archivo agosto 2026 (24 meses: sep 2024 → ago 2026)
-BASE_PERIODO  = 202608          # AAAAMM del mes índice 0 (más reciente)
+# (ruta, AAAAMM de su mes más reciente). Cada 24DSF trae 24 meses.
+ARCHIVOS_24DSF = [
+    ("24DSF.txt",                      202608),   # sep 2024 → ago 2026
+    ("24DSF_anterior/24DSF_viejo.txt", 202601),   # feb 2024 → ene 2026
+]
+MESES_ARCHIVO = 24              # meses que trae cada 24DSF
 ENTIDAD_FOCAL = "72"            # Santander Argentina
 HORIZON_A     = 3               # meses a futuro para target_a
+HORIZON_B     = 6               # meses a futuro para target_b
 HORIZON_C     = 12              # meses a futuro para target_c
 HISTORIA_MIN  = 6               # meses de historia (t incluido) que usan las features
 VENTANA_CORTA = 3               # ventana corta de los conteos de meses con deuda
@@ -127,7 +140,7 @@ BIT_TIPO = {
 
 
 # ── mapeo índice → período AAAAMM ──────────────────────────────────────────────
-# idx 0 = más reciente (BASE_PERIODO), idx 23 = más antiguo
+# idx 0 = más reciente (BASE_PERIODO), idx N_MESES-1 = más antiguo
 def idx_a_periodo(base, idx):
     y, m = base // 100, base % 100
     m -= idx
@@ -136,7 +149,32 @@ def idx_a_periodo(base, idx):
         y -= 1
     return y * 100 + m
 
-PERIODOS = [idx_a_periodo(BASE_PERIODO, i) for i in range(24)]
+def meses_entre(a, b):
+    """Cantidad de meses de b a a (AAAAMM)."""
+    return (a // 100 * 12 + a % 100) - (b // 100 * 12 + b % 100)
+
+def plan_archivos():
+    """
+    Para cada archivo, devuelve (ruta, desfase, desde): su mes local i es el
+    índice global i + desfase, y solo aporta los meses locales i >= desde (los
+    anteriores ya los cubre un archivo más nuevo).
+    """
+    plan, cubierto = [], 0
+    for ruta, base in sorted(ARCHIVOS_24DSF, key=lambda a: -a[1]):
+        desfase = meses_entre(BASE_PERIODO, base)
+        if desfase > cubierto:
+            raise ValueError(f"faltan meses entre los archivos: {ruta} empieza en "
+                             f"{base} y los más nuevos llegan hasta "
+                             f"{idx_a_periodo(BASE_PERIODO, cubierto - 1)}")
+        desde = cubierto - desfase
+        if desde < MESES_ARCHIVO:
+            plan.append((ruta, desfase, desde))
+            cubierto = desfase + MESES_ARCHIVO
+    return plan, cubierto
+
+BASE_PERIODO = max(base for _, base in ARCHIVOS_24DSF)
+PLAN, N_MESES = plan_archivos()
+PERIODOS = [idx_a_periodo(BASE_PERIODO, i) for i in range(N_MESES)]
 
 
 # ── parser de meses 24DSF ───────────────────────────────────────────────────────
@@ -199,7 +237,7 @@ def demograficos(cuit):
 
 # ── helpers de acceso a meses ──────────────────────────────────────────────────
 def get(arr, idx, default):
-    return arr[idx] if 0 <= idx < 24 else default
+    return arr[idx] if 0 <= idx < N_MESES else default
 
 def meses_consec_normal(sits, desde_idx, tope):
     """Meses consecutivos con sit=1 desde desde_idx hacia el pasado, hasta tope."""
@@ -215,12 +253,16 @@ def meses_con_deuda(con_deuda, desde_idx, ventana):
 
 
 # ── acumulador de otras entidades por CUIT ─────────────────────────────────────
-# agg[k*24 + idx] para cada campo k:
+# agg[k*N_MESES + idx] para cada campo k:
 F_N, F_PEOR, F_N2, F_N3P, F_JUD, F_TIPOS = range(6)
 
 def nuevo_acumulador():
-    # array de enteros (6 campos × 24 meses) + array de montos (24 meses)
-    return array("i", bytes(6 * 24 * 4)), array("d", bytes(24 * 8))
+    # array de enteros (6 campos × N_MESES) + array de montos (N_MESES)
+    return array("i", bytes(6 * N_MESES * 4)), array("d", bytes(N_MESES * 8))
+
+def nueva_historia():
+    # (sits, montos, juds) de N_MESES posiciones
+    return array("b", bytes(N_MESES)), array("d", bytes(N_MESES * 8)), array("b", bytes(N_MESES))
 
 
 # ── esquema de salida ──────────────────────────────────────────────────────────
@@ -262,6 +304,7 @@ SCHEMA = pa.schema([
     ("sexo_proxy",                pa.string()),
     ("rango_edad_proxy",          pa.string()),
     ("target_a",                  pa.float32()),   # float para admitir None
+    ("target_b",                  pa.float32()),
     ("target_c",                  pa.float32()),
 ])
 COLS = SCHEMA.names
@@ -272,84 +315,98 @@ def main():
     print("=" * 60)
     print("Script 02 - Construcción dataset EWS v2")
     print("=" * 60)
-    print(f"  Archivo    : {ARCHIVO_24DSF}")
-    print(f"  Base período: {BASE_PERIODO}  ({PERIODOS[23]} → {PERIODOS[0]})")
+    for ruta, desfase, desde in PLAN:
+        print(f"  Archivo    : {ruta}  (aporta {PERIODOS[desfase + MESES_ARCHIVO - 1]}"
+              f" → {PERIODOS[desfase + desde]})")
+    print(f"  Historia   : {N_MESES} meses ({PERIODOS[-1]} → {PERIODOS[0]})")
     print(f"  Target A   : caída a sit>=2 en {HORIZON_A} meses")
+    print(f"  Target B   : sit>=2 dos meses seguidos en {HORIZON_B} meses")
     print(f"  Target C   : caída a sit>=3 en {HORIZON_C} meses")
-    print(f"  Historia   : {HISTORIA_MIN} meses (filas desde {PERIODOS[24 - HISTORIA_MIN]})")
+    print(f"  Historia mín: {HISTORIA_MIN} meses (filas desde {PERIODOS[N_MESES - HISTORIA_MIN]})")
     print()
 
-    if not os.path.exists(ARCHIVO_24DSF):
-        print(f"ERROR: no se encuentra {ARCHIVO_24DSF}")
-        return
+    for ruta, _, _ in PLAN:
+        if not os.path.exists(ruta):
+            print(f"ERROR: no se encuentra {ruta}")
+            return
 
     # ── PASADA 1: identificar CUITs elegibles de Santander ─────────────────────
     print("[1] Pasada 1 — CUITs de Santander con prefiltro...")
-    sant = {}   # cuit → (sits, montos, juds)
-    n = 0
-    with open(ARCHIVO_24DSF, encoding="latin-1") as f:
-        for line in f:
-            n += 1
-            if n % 5_000_000 == 0:
-                print(f"  {n/1e6:.0f}M líneas | {len(sant):,} CUITs elegibles")
-            line = line.rstrip("\r\n")
-            if len(line) < 378:
-                continue
-            if line[0:5].strip() != ENTIDAD_FOCAL:
-                continue
-            cuit = line[7:18]
-            if not es_elegible(cuit):
-                continue
-            meses = parsear_meses(line)
-            if any(s > 0 for s in meses[0]):
-                sant[cuit] = meses
+    sant = {}   # cuit → (sits, montos, juds) de N_MESES
+    for ruta, desfase, desde in PLAN:
+        print(f"  {ruta}")
+        n = 0
+        with open(ruta, encoding="latin-1") as f:
+            for line in f:
+                n += 1
+                if n % 5_000_000 == 0:
+                    print(f"  {n/1e6:.0f}M líneas | {len(sant):,} CUITs elegibles")
+                line = line.rstrip("\r\n")
+                if len(line) < 378:
+                    continue
+                if line[0:5].strip() != ENTIDAD_FOCAL:
+                    continue
+                cuit = line[7:18]
+                if not es_elegible(cuit):
+                    continue
+                sits, montos, juds = parsear_meses(line)
+                if not any(sits[i] > 0 for i in range(desde, MESES_ARCHIVO)):
+                    continue
+                h_sits, h_montos, h_juds = sant.get(cuit) or sant.setdefault(cuit, nueva_historia())
+                for i in range(desde, MESES_ARCHIVO):
+                    h_sits[i + desfase]   = sits[i]
+                    h_montos[i + desfase] = montos[i]
+                    h_juds[i + desfase]   = juds[i]
+        print(f"  Total líneas   : {n:,}")
 
-    print(f"\n  Total líneas   : {n:,}")
-    print(f"  CUITs elegibles: {len(sant):,}")
+    print(f"\n  CUITs elegibles: {len(sant):,}")
 
     # ── PASADA 2: acumular otras entidades para esos CUITs ─────────────────────
     # otras[cuit] = (agg, montos_sum); se crea solo si el CUIT tiene deuda en
     # alguna otra entidad. Ver F_* para el layout de agg.
     print(f"\n[2] Pasada 2 — acumulando otras entidades para {len(sant):,} CUITs...")
     otras = {}
-    n = 0
-    with open(ARCHIVO_24DSF, encoding="latin-1") as f:
-        for line in f:
-            n += 1
-            if n % 5_000_000 == 0:
-                print(f"  {n/1e6:.0f}M líneas | {len(otras):,} CUITs con otras entidades")
-            line = line.rstrip("\r\n")
-            if len(line) < 378:
-                continue
-            cuit = line[7:18]
-            if cuit not in sant:
-                continue
-            entidad = line[0:5].strip()
-            if entidad == ENTIDAD_FOCAL:
-                continue
-            bit = BIT_TIPO[tipo_entidad(entidad)]
-            sits, montos, juds = parsear_meses(line)
-            acc = None
-            for idx in range(24):
-                s = sits[idx]
-                if s == 0:
-                    continue   # sin deuda en este mes, no aporta
-                if acc is None:
-                    acc = otras.get(cuit)
+    for ruta, desfase, desde in PLAN:
+        print(f"  {ruta}")
+        n = 0
+        with open(ruta, encoding="latin-1") as f:
+            for line in f:
+                n += 1
+                if n % 5_000_000 == 0:
+                    print(f"  {n/1e6:.0f}M líneas | {len(otras):,} CUITs con otras entidades")
+                line = line.rstrip("\r\n")
+                if len(line) < 378:
+                    continue
+                cuit = line[7:18]
+                if cuit not in sant:
+                    continue
+                entidad = line[0:5].strip()
+                if entidad == ENTIDAD_FOCAL:
+                    continue
+                bit = BIT_TIPO[tipo_entidad(entidad)]
+                sits, montos, juds = parsear_meses(line)
+                acc = None
+                for i in range(desde, MESES_ARCHIVO):
+                    s = sits[i]
+                    if s == 0:
+                        continue   # sin deuda en este mes, no aporta
                     if acc is None:
-                        acc = otras[cuit] = nuevo_acumulador()
-                agg, msum = acc
-                if agg[F_N * 24 + idx] == 0 or s > agg[F_PEOR * 24 + idx]:
-                    agg[F_PEOR * 24 + idx] = s
-                agg[F_N * 24 + idx] += 1
-                if s == 2:
-                    agg[F_N2 * 24 + idx] += 1
-                elif s >= 3:
-                    agg[F_N3P * 24 + idx] += 1
-                if juds[idx] > 0:
-                    agg[F_JUD * 24 + idx] = 1
-                agg[F_TIPOS * 24 + idx] |= bit
-                msum[idx] += montos[idx]
+                        acc = otras.get(cuit)
+                        if acc is None:
+                            acc = otras[cuit] = nuevo_acumulador()
+                    agg, msum = acc
+                    idx = i + desfase
+                    if agg[F_N * N_MESES + idx] == 0 or s > agg[F_PEOR * N_MESES + idx]:
+                        agg[F_PEOR * N_MESES + idx] = s
+                    agg[F_N * N_MESES + idx] += 1
+                    if s == 2:
+                        agg[F_N2 * N_MESES + idx] += 1
+                    elif s >= 3:
+                        agg[F_N3P * N_MESES + idx] += 1
+                    if juds[i] > 0:
+                        agg[F_JUD * N_MESES + idx] = 1
+                    agg[F_TIPOS * N_MESES + idx] |= bit
+                    msum[idx] += montos[i]
 
     print(f"  Pasada 2 completa. {len(otras):,} CUITs con deuda en otras entidades.")
 
@@ -369,19 +426,19 @@ def main():
             filas_bloque = 0
 
     vacio = nuevo_acumulador()   # para CUITs sin otras entidades
-    n_obs = n_valida_a = n_valida_c = n_pos_a = n_pos_c = 0
+    n_obs = n_valida_a = n_valida_b = n_valida_c = n_pos_a = n_pos_b = n_pos_c = 0
 
     for cuit, (s_sits, s_montos, s_juds) in sant.items():
         sexo, rango = demograficos(cuit)
         agg, msum = otras.get(cuit, vacio)
 
-        def n_o(i):    return agg[F_N * 24 + i]
-        def peor_o(i): return agg[F_PEOR * 24 + i] if agg[F_N * 24 + i] else 0
+        def n_o(i):    return agg[F_N * N_MESES + i]
+        def peor_o(i): return agg[F_PEOR * N_MESES + i] if agg[F_N * N_MESES + i] else 0
         def deuda_sant(i):    return s_sits[i] > 0
         def deuda_sistema(i): return s_sits[i] > 0 or n_o(i) > 0
 
-        # solo períodos con HISTORIA_MIN meses de historia dentro del archivo
-        for idx in range(24 - HISTORIA_MIN + 1):
+        # solo períodos con HISTORIA_MIN meses de historia dentro de los archivos
+        for idx in range(N_MESES - HISTORIA_MIN + 1):
             # sin deuda en Santander este mes → no hay observación
             s_sant = s_sits[idx]
             if s_sant == 0:
@@ -395,9 +452,10 @@ def main():
 
             # condición de entrada por target
             valida_a = (peor_sistema == 1 and idx >= HORIZON_A)
+            valida_b = (peor_sistema == 1 and idx >= HORIZON_B)
             valida_c = (0 < peor_sistema <= 2 and idx >= HORIZON_C)
 
-            if not valida_a and not valida_c:
+            if not (valida_a or valida_b or valida_c):
                 continue
 
             n_obs += 1
@@ -410,11 +468,17 @@ def main():
                     return max(ss, peor_o(i))
                 return ss if ss > 0 else 0
 
-            ta = tc = None
+            ta = tb = tc = None
             if valida_a:
                 ta = int(any(peor_en(idx - k) >= 2 for k in range(1, HORIZON_A + 1)))
                 n_valida_a += 1
                 n_pos_a    += ta
+            if valida_b:
+                # dos meses seguidos (t+k y t+k+1) con sit >= 2 dentro del horizonte
+                tb = int(any(peor_en(idx - k) >= 2 and peor_en(idx - k - 1) >= 2
+                             for k in range(1, HORIZON_B)))
+                n_valida_b += 1
+                n_pos_b    += tb
             if valida_c:
                 tc = int(any(peor_en(idx - k) >= 3 for k in range(1, HORIZON_C + 1)))
                 n_valida_c += 1
@@ -427,7 +491,7 @@ def main():
                            if monto_t3 > 0 else None
 
             # ── features otras entidades ──────────────────────────────────────
-            tipos_o      = agg[F_TIPOS * 24 + idx]
+            tipos_o      = agg[F_TIPOS * N_MESES + idx]
             monto_otras  = msum[idx]
             log_monto_o  = round(math.log1p(monto_otras), 4) if monto_otras > 0 else 0.0
 
@@ -455,11 +519,11 @@ def main():
                 # ── otras entidades ──
                 n_otras,
                 peor_ot,
-                agg[F_N2 * 24 + idx],
-                agg[F_N3P * 24 + idx],
+                agg[F_N2 * N_MESES + idx],
+                agg[F_N3P * N_MESES + idx],
                 round(monto_otras, 1),
                 log_monto_o,
-                agg[F_JUD * 24 + idx],
+                agg[F_JUD * N_MESES + idx],
                 int(bool(tipos_o & BIT_TIPO["banco_publico"])),
                 int(bool(tipos_o & BIT_TIPO["banco_privado"])),
                 int(bool(tipos_o & BIT_TIPO["banco_digital"])),
@@ -480,6 +544,7 @@ def main():
                 rango,
                 # ── targets ──
                 ta,
+                tb,
                 tc,
             )
             assert len(valores) == len(COLS)
@@ -494,7 +559,8 @@ def main():
 
     print(f"  Observaciones totales  : {n_obs:,}")
     print(f"  Válidas target A       : {n_valida_a:,}  | positivos: {n_pos_a:,} ({n_pos_a/n_valida_a*100:.1f}%)" if n_valida_a else "  Target A: sin obs")
-    print(f"  Válidas target C       : {n_valida_c:,}  | positivos: {n_pos_c:,} ({n_pos_c/n_valida_c*100:.1f}%)" if n_valida_c else "  Target C: sin obs")
+    print(f"  Válidas target B       : {n_valida_b:,}  | positivos: {n_pos_b:,} ({n_pos_b/n_valida_b*100:.1f}%)" if n_valida_b else "  Target B: sin obs")
+    print(f"  Válidas target C       :{n_valida_c:,}  | positivos: {n_pos_c:,} ({n_pos_c/n_valida_c*100:.1f}%)" if n_valida_c else "  Target C: sin obs")
 
     # ── guardar parquet ────────────────────────────────────────────────────────
     print(f"\n[4] Guardando {OUTPUT}...")
