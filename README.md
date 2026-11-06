@@ -21,6 +21,22 @@ de la Central de Deudores del BCRA (archivo 24DSF, 24 meses de historia).
 
 `02_extraer_santander.py` es una versión anterior del paso 2 que quedó solo de referencia.
 
+## Validación
+
+- **Por persona:** train y test tienen CUITs distintos (80/20, estratificado por
+  "alguna vez `target_c` = 1"). Cada CUIT entra con su historia completa.
+- **Fuera de tiempo:** las columnas `oot_a` y `oot_c` marcan cada fila como
+  `train`, `hueco` o `test` según su período. Test son los últimos 3 meses
+  válidos del target; train, los períodos cuya ventana del target termina antes
+  del test. Las filas del hueco no se usan, porque su respuesta depende de meses
+  del test.
+- **Historia mínima:** las features miran como mucho 6 meses atrás y solo hay
+  filas para períodos con esos 6 meses dentro del archivo, para que signifiquen
+  lo mismo que en producción.
+
+Con un solo 24DSF (24 meses), `target_c` no tiene períodos de train fuera de
+tiempo: hacen falta más meses de historia.
+
 ## Datos
 
 Los datos **no están en el repo**: son archivos pesados (~22 GB) y contienen
