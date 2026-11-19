@@ -15,15 +15,24 @@ Filtros aplicados en pasada 1 (sobre los clientes de Santander):
   - Mayor de edad estimado: DNI < 48.000.000 (nacidos antes de 2008)
   - Excluye extranjeros: DNI >= 90.000.000
 
-Targets:
-  target_a: caída a sit >= 2 en cualquier entidad en los próximos 3 meses
+Targets (ventana de H meses que empieza en t + INICIO_VENTANA):
+  target_a: caída a sit >= 2 en cualquier entidad en una ventana de 3 meses
             (condición de entrada: sit = 1 en TODO el sistema en t)
-  target_b: sit >= 2 dos meses seguidos en cualquier entidad dentro de los
-            próximos 6 meses (aproxima 60+ días de atraso: el 24DSF no trae
-            días, y sit 2 cubre de 31 a 90 días)
+  target_b: sit >= 2 dos meses seguidos en cualquier entidad, ambos dentro de
+            una ventana de 6 meses (aproxima 60+ días de atraso: el 24DSF no
+            trae días, y sit 2 cubre de 31 a 90 días)
             (condición de entrada: sit = 1 en TODO el sistema en t)
-  target_c: caída a sit >= 3 en cualquier entidad en los próximos 12 meses
+  target_c: caída a sit >= 3 en cualquier entidad en una ventana de 12 meses
             (condición de entrada: sit <= 2 en TODO el sistema en t)
+
+  Ventana principal: t+2 .. t+H+1 (INICIO_VENTANA = 2). El 24DSF de t se
+  publica a fines de t+1, que es cuando se puntúa; una sit 2 al cierre de t+1
+  ya no es accionable. Ver docs/decisiones_metodologicas.md (duda 1).
+  Sensibilidad: target_a_t1 / target_b_t1 / target_c_t1 con la ventana
+  t+1 .. t+H (INICIO_VENTANA_SENS = 1), en la misma corrida.
+
+  Los parámetros de las ventanas se guardan en los metadatos del parquet para
+  que 03_split.py arme la validación fuera de tiempo con los mismos valores.
 
 Features principales:
   Santander:
@@ -39,7 +48,9 @@ Features principales:
     - n_ent_sit2_otras_t
     - n_ent_sit3plus_otras_t
     - tiene_judicial_otras_t
-    - log_monto_otras_t
+    - monto_otras_t, monto_otras_t3, log_monto_otras
+      (los montos son nominales; la versión real con CER, share_sant y los
+       deciles por período se calculan en 03_split.py)
     - otras_tiene_banco_publico / privado / digital / financiera / billetera / prov_nofinanciero
     - otras_n_tipos_entidad
 
@@ -94,6 +105,8 @@ ENTIDAD_FOCAL = "72"            # Santander Argentina
 HORIZON_A     = 3               # meses a futuro para target_a
 HORIZON_B     = 6               # meses a futuro para target_b
 HORIZON_C     = 12              # meses a futuro para target_c
+INICIO_VENTANA      = 2         # ventana principal: t+2 .. t+H+1
+INICIO_VENTANA_SENS = 1         # sensibilidad (sufijo _t1): t+1 .. t+H
 HISTORIA_MIN  = 6               # meses de historia (t incluido) que usan las features
 VENTANA_CORTA = 3               # ventana corta de los conteos de meses con deuda
 DNI_MAYOR_18  = 48_000_000      # DNI < este → mayor de 18 en 2026
@@ -286,6 +299,7 @@ SCHEMA = pa.schema([
     ("n_ent_sit2_otras_t",        pa.int8()),
     ("n_ent_sit3plus_otras_t",    pa.int8()),
     ("monto_otras_t",             pa.float32()),
+    ("monto_otras_t3",            pa.float32()),
     ("log_monto_otras",           pa.float32()),
     ("tiene_judicial_otras_t",    pa.int8()),
     ("otras_tiene_banco_publico", pa.int8()),
@@ -306,8 +320,27 @@ SCHEMA = pa.schema([
     ("target_a",                  pa.float32()),   # float para admitir None
     ("target_b",                  pa.float32()),
     ("target_c",                  pa.float32()),
-])
+    ("target_a_t1",               pa.float32()),   # sensibilidad: ventana t+1..t+H
+    ("target_b_t1",               pa.float32()),
+    ("target_c_t1",               pa.float32()),
+]).with_metadata({
+    # 03_split.py los lee para la validación fuera de tiempo
+    "ews_horizontes": f"target_a={HORIZON_A},target_b={HORIZON_B},target_c={HORIZON_C}",
+    "ews_inicio_ventana": str(INICIO_VENTANA),
+    "ews_inicio_ventana_sens": str(INICIO_VENTANA_SENS),
+})
 COLS = SCHEMA.names
+
+# (columna, horizonte, inicio de ventana, condición de entrada, regla) por target
+TARGETS = [
+    (f"target_{t}{suf}", h, ini, entrada, regla)
+    for suf, ini in (("", INICIO_VENTANA), ("_t1", INICIO_VENTANA_SENS))
+    for t, h, entrada, regla in (
+        ("a", HORIZON_A, "sit1",   "sit2"),
+        ("b", HORIZON_B, "sit1",   "sit2_consec"),
+        ("c", HORIZON_C, "sit1_2", "sit3"),
+    )
+]
 
 
 # ── main ────────────────────────────────────────────────────────────────────────
@@ -322,6 +355,7 @@ def main():
     print(f"  Target A   : caída a sit>=2 en {HORIZON_A} meses")
     print(f"  Target B   : sit>=2 dos meses seguidos en {HORIZON_B} meses")
     print(f"  Target C   : caída a sit>=3 en {HORIZON_C} meses")
+    print(f"  Ventana    : desde t+{INICIO_VENTANA} (sensibilidad _t1: desde t+{INICIO_VENTANA_SENS})")
     print(f"  Historia mín: {HISTORIA_MIN} meses (filas desde {PERIODOS[N_MESES - HISTORIA_MIN]})")
     print()
 
@@ -426,7 +460,9 @@ def main():
             filas_bloque = 0
 
     vacio = nuevo_acumulador()   # para CUITs sin otras entidades
-    n_obs = n_valida_a = n_valida_b = n_valida_c = n_pos_a = n_pos_b = n_pos_c = 0
+    n_obs = 0
+    n_valida = {col: 0 for col, *_ in TARGETS}
+    n_pos    = {col: 0 for col, *_ in TARGETS}
 
     for cuit, (s_sits, s_montos, s_juds) in sant.items():
         sexo, rango = demograficos(cuit)
@@ -450,39 +486,40 @@ def main():
             # peor situación en TODO el sistema (Santander + otras)
             peor_sistema = max(s_sant, peor_ot)
 
-            # condición de entrada por target
-            valida_a = (peor_sistema == 1 and idx >= HORIZON_A)
-            valida_b = (peor_sistema == 1 and idx >= HORIZON_B)
-            valida_c = (0 < peor_sistema <= 2 and idx >= HORIZON_C)
-
-            if not (valida_a or valida_b or valida_c):
-                continue
-
-            n_obs += 1
-
             # ── targets ───────────────────────────────────────────────────────
-            # futuro = índices menores (idx-1, idx-2, ...)
+            # futuro = índices menores: el mes t+k es idx-k. Un target es válido
+            # si se cumple su condición de entrada y su ventana (t+ini ..
+            # t+ini+h-1) cae entera dentro de los archivos.
             def peor_en(i):
                 ss = s_sits[i]
                 if n_o(i):
                     return max(ss, peor_o(i))
                 return ss if ss > 0 else 0
 
-            ta = tb = tc = None
-            if valida_a:
-                ta = int(any(peor_en(idx - k) >= 2 for k in range(1, HORIZON_A + 1)))
-                n_valida_a += 1
-                n_pos_a    += ta
-            if valida_b:
-                # dos meses seguidos (t+k y t+k+1) con sit >= 2 dentro del horizonte
-                tb = int(any(peor_en(idx - k) >= 2 and peor_en(idx - k - 1) >= 2
-                             for k in range(1, HORIZON_B)))
-                n_valida_b += 1
-                n_pos_b    += tb
-            if valida_c:
-                tc = int(any(peor_en(idx - k) >= 3 for k in range(1, HORIZON_C + 1)))
-                n_valida_c += 1
-                n_pos_c    += tc
+            entrada = {"sit1": peor_sistema == 1, "sit1_2": 0 < peor_sistema <= 2}
+            valores_t = []
+            for col, h, ini, cond, regla in TARGETS:
+                if not (entrada[cond] and idx >= ini + h - 1):
+                    valores_t.append(None)
+                    continue
+                ventana = range(ini, ini + h)
+                if regla == "sit2":
+                    v = any(peor_en(idx - k) >= 2 for k in ventana)
+                elif regla == "sit3":
+                    v = any(peor_en(idx - k) >= 3 for k in ventana)
+                else:
+                    # dos meses seguidos (t+k y t+k+1) con sit >= 2, ambos en la ventana
+                    v = any(peor_en(idx - k) >= 2 and peor_en(idx - k - 1) >= 2
+                            for k in ventana[:-1])
+                v = int(v)
+                valores_t.append(v)
+                n_valida[col] += 1
+                n_pos[col]    += v
+
+            if all(v is None for v in valores_t):
+                continue
+
+            n_obs += 1
 
             # ── features Santander ────────────────────────────────────────────
             monto_t  = s_montos[idx]
@@ -522,6 +559,7 @@ def main():
                 agg[F_N2 * N_MESES + idx],
                 agg[F_N3P * N_MESES + idx],
                 round(monto_otras, 1),
+                round(get(msum, idx + 3, 0.0), 1),
                 log_monto_o,
                 agg[F_JUD * N_MESES + idx],
                 int(bool(tipos_o & BIT_TIPO["banco_publico"])),
@@ -542,10 +580,8 @@ def main():
                 # ── demografía ──
                 sexo,
                 rango,
-                # ── targets ──
-                ta,
-                tb,
-                tc,
+                # ── targets (orden de TARGETS) ──
+                *valores_t,
             )
             assert len(valores) == len(COLS)
             for col, v in zip(COLS, valores):
@@ -558,9 +594,10 @@ def main():
     writer.close()
 
     print(f"  Observaciones totales  : {n_obs:,}")
-    print(f"  Válidas target A       : {n_valida_a:,}  | positivos: {n_pos_a:,} ({n_pos_a/n_valida_a*100:.1f}%)" if n_valida_a else "  Target A: sin obs")
-    print(f"  Válidas target B       : {n_valida_b:,}  | positivos: {n_pos_b:,} ({n_pos_b/n_valida_b*100:.1f}%)" if n_valida_b else "  Target B: sin obs")
-    print(f"  Válidas target C       : {n_valida_c:,}  | positivos: {n_pos_c:,} ({n_pos_c/n_valida_c*100:.1f}%)" if n_valida_c else "  Target C: sin obs")
+    for col, *_ in TARGETS:
+        nv, npos = n_valida[col], n_pos[col]
+        print(f"  Válidas {col:<12}: {nv:,}  | positivos: {npos:,} ({npos/nv*100:.1f}%)"
+              if nv else f"  {col}: sin obs")
 
     # ── guardar parquet ────────────────────────────────────────────────────────
     print(f"\n[4] Guardando {OUTPUT}...")

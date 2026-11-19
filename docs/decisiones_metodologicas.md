@@ -43,13 +43,13 @@ Población: CUITs en situación 1 en *t*.
 - **Motivo:** una situación 2 al cierre de *t+1* implica una cuota vencida en *t*, antes del momento de scoring. No es accionable para el banco.
 - Las caídas en *t+1* que persisten en *t+2* o después cuentan como positivas. No se excluyen filas.
 - **Sensibilidad:** se entrena también con la ventana *t+1..t+H* y se reporta la caída de la métrica.
-- Estado: **pendiente de implementar** (el inicio de la ventana pasa a ser un parámetro en 02).
+- **Implementación (02):** el inicio de la ventana es un parámetro (`INICIO_VENTANA = 2`). Los targets de sensibilidad (`target_a_t1`, `target_b_t1`, `target_c_t1`) se generan en la misma corrida. Los parámetros se guardan en los metadatos del parquet y 03 los lee para la validación OOT.
 
 ### 2.4 Duda 2: inflación (decidida 2026-11-15)
 - **Deflactar con CER** (se eligió CER sobre IPC INDEC; se agrega en 01): monto_sant_t, monto_sant_t3 (con el CER del propio mes), monto_otras_t, sus logs, var_monto_3m_sant y las variables macro nominales.
 - **Features libres de inflación:** share_sant = monto_sant / (monto_sant + monto_otras) en *t* y *t3* (requiere crear monto_otras_t3). También deciles por período en *t* y *t3* para monto_sant y monto_otras (en otras: decil 0 = sin deuda y deciles 1-10 entre los que tienen deuda > 0). Se calculan en 03, con una primera pasada para los cortes de cada período.
 - **Sensibilidad OOT:** se comparan montos nominales, montos reales y solo ratios/deciles.
-- Estado: **pendiente de implementar**.
+- **Implementación (03_split.py):** los montos reales se expresan en pesos del último período del dataset. Los cortes de deciles de cada período se calculan con las filas en sit 1 en todo el sistema (la población de A y B), para que el decil signifique lo mismo en todos los períodos: desde 202508 solo hay filas válidas para A/B, y si se incluyeran los deudores en sit 2 de C en los períodos anteriores, la población cambiaría. El decil 0 (sin deuda) se aplica a los cuatro montos, porque monto_sant_t3 también puede ser 0.
 
 ### 2.5 Duda 3: target C (decidida 2026-11-15)
 - C queda como **target secundario**, validado solo con el split por CUIT, sin validación fuera de tiempo.
@@ -70,21 +70,21 @@ Un mismo CUIT aparece en muchos períodos, con filas muy parecidas, así que esa
 - Se entrenan modelos **con y sin variables macro** y se comparan. No está claro que aporten: son constantes dentro de cada mes, así que no pueden ordenar deudores dentro de un mismo mes de scoring salvo por interacciones con las variables individuales. Además, con pocos meses de entrenamiento hay riesgo de sobreajustar al período.
 - En la versión con macro, cada variable debe usar **el último dato publicado al momento del scoring** (fines de *t+1*) para evitar fuga de información. La tabla de rezagos está en revisión (ver 4.4).
 - **Se eliminan las 7 columnas macro rotas** (decidido 2026-11-18): resultado_neto_mensual, intereses_ganados, intereses_pagados, margen_intermediacion, roa_proxy, tasa_hipotecarios_privado_pct y n_entidades_financieras.
-- **Regla de rezago** (decidida 2026-11-18): la macro describe el mes *t*, el mismo momento en que se informó al cliente. Se usa el valor de *t* si ya estaba publicado al momento del scoring (fines de *t+1*); si no, el de *t-1*. Según la descarga del 27/10/2026: tipo de cambio y tasas de consumo en *t*; mora del sistema, BADLAR, crédito y composición de la cartera en *t-1*. Se va a confirmar con una segunda descarga a principios de diciembre de 2026.
+- **Regla de rezago** (decidida 2026-11-18): la macro describe el mes *t*, el mismo momento en que se informó al cliente. Se usa el valor de *t* si ya estaba publicado al momento del scoring (fines de *t+1*); si no, el de *t-1*. La primera descarga (27/10/2026) sugería *t-1* para la mora del sistema y BADLAR. La segunda (18/11/2026) mostró que la mora y BADLAR de 202610 ya estaban publicadas a mediados de noviembre, y que 202609 era un **hueco** de la serie, no un atraso. **Rezagos finales:** todas las variables en *t*, salvo var_credito_real_3m_pct en *t-1* (el crédito privado de 202610 todavía no estaba publicado el 18/11). Los meses faltantes (202601 y 202609 en la mora y BADLAR) quedan vacíos.
 - **Reducción a 10 variables macro** (decidida 2026-11-18). Motivos: (a) redundancia: sistema y privado correlacionan en 1,000, y todos los niveles en pesos correlacionan entre 0,97 y 0,999 entre sí y con el tipo de cambio, porque reflejan inflación y no crédito ni liquidez; (b) hay solo ~25 valores distintos por variable (uno por mes), con alto riesgo de sobreajustar al período.
 
   | Variable | Mes |
   |---|---|
-  | mora_3plus_privado_pct | *t-1* |
-  | sit2_privado_pct | *t-1* |
-  | var_mora3plus_3m | *t-1* |
-  | var_sit2_3m | *t-1* |
+  | mora_3plus_privado_pct | *t* |
+  | sit2_privado_pct | *t* |
+  | var_mora3plus_3m (sobre el sector privado) | *t* |
+  | var_sit2_3m (sobre el sector privado) | *t* |
   | tasa_consumo_corto_pct | *t* |
-  | badlar_privados_tna_pct | *t-1* |
-  | spread_consumo_badlar_pct | *t-1* |
+  | badlar_privados_tna_pct | *t* |
+  | spread_consumo_badlar_pct | *t* |
   | var_tc_3m_pct (nueva: variación % del tipo de cambio en 3 meses) | *t* |
   | var_credito_real_3m_pct (nueva: crédito privado deflactado por CER) | *t-1* |
-  | pct_personales | *t-1* |
+  | pct_personales | *t* |
 
   Se descartan: versiones "sistema", sit3/sit4/sit5, cartera_irregular, variaciones a 1 mes, reservas, base monetaria, depósitos, niveles de crédito y préstamos en pesos, y la composición de la cartera salvo personales.
 
@@ -109,6 +109,8 @@ Regla general: todo lo que se aprende de los datos se ajusta **solo con train**,
 3. **Montos nominales en contexto de alta inflación.** Se mitiga con el CER y con ratios/deciles, pero la deflación es una aproximación.
 4. **Granularidad de la Central de Deudores.** Es mensual, informa la situación por entidad y no la fecha exacta de atraso. Los días de mora se infieren de la situación.
 5. **Rezago de publicación.** Obliga a dejar fuera *t+1*, lo que reduce la ventana efectiva de predicción.
+6. **Series macro revisadas, no en tiempo real.** El BCRA revisa datos hacia atrás (por ejemplo, la tasa de consumo de 202608 pasó de 79,37 a 78,83 entre el 27/10 y el 18/11/2026). Se usan los valores revisados a la fecha de descarga, no los que el banco veía en cada momento. Los rezagos de publicación se infieren de solo dos descargas.
+7. **Huecos en las series del BCRA.** Faltan 202601 y 202609 en la situación de cartera del sistema y en BADLAR. Quedan vacíos, igual que las variaciones a 3 meses que dependen de esos meses.
 
 ---
 
@@ -121,12 +123,12 @@ Regla general: todo lo que se aprende de los datos se ajusta **solo con train**,
    - Las 5 series de rentabilidad (resultado_neto, intereses ganados/pagados, margen, roa_proxy) son **siempre 0**: los códigos de serie no traen datos.
    - tasa_hipotecarios_privado_pct está en 0 en 22 de los 33 meses desde 2024.
    - n_entidades_financieras toma valores de cientos de millones: el código de serie no corresponde a una cantidad de entidades.
-   - Rezagos de publicación observados en la descarga del 27/10/2026 (aprox. el momento de scoring de *t* = 202609): situación de cartera y préstamos por tipo llegan hasta *t-1*; reservas, tipo de cambio, base monetaria y tasas de consumo/adelantos, hasta *t*; depósitos, crédito privado y BADLAR, hasta *t-1*. Es una sola foto: el rezago real puede variar entre meses.
+   - Rezagos de publicación: ver 2.7. La primera descarga hizo pasar un hueco de la serie (202609) por un atraso de publicación, y la segunda lo corrigió.
+   - Corregido en 01 (rama implementar-decisiones-1-6): los faltantes quedan vacíos, las variaciones se calculan por mes calendario y quedan vacías si falta un extremo, y el CER se baja de la API v4.0 del BCRA (variable 30, último día de cada mes).
 5. **Datos sensibles.** Los datos contienen CUITs reales, por lo que nunca se suben al repositorio público; solo se versiona el código.
 
 ---
 
 ## 5. Dudas abiertas
 
-- Se confirmarán los rezagos de la macro con una segunda descarga (principios de diciembre de 2026).
 - La regresión logística sobre ~28M de filas puede no entrar en memoria. Si pasa, se decidirá si se entrena sobre una muestra de train (por CUIT).
