@@ -102,6 +102,21 @@ Regla general: todo lo que se aprende de los datos se ajusta **solo con train**,
 
 ---
 
+### 2.10 Dataset resultante (corrida del 2026-11-19, main = 44457eb)
+- 35.378.076 filas (CUIT × período, 202407–202605), 2.110.047 CUITs. Split por CUIT: 28.303.504 filas en train y 7.074.572 en test (422.009 CUITs). 72 columnas.
+
+  | Target | Filas válidas | % positivos | OOT train / hueco / test (meses) |
+  |---|---|---|---|
+  | A (t+2..t+4) | 33,3M | 6,5% | 16 / 3 / 3 |
+  | B (t+2..t+7) | 29,0M | 7,5% | 10 / 6 / 3 |
+  | C (t+2..t+13) | 20,7M | 13,3% | 0 / 10 / 3 |
+  | A_t1 (t+1..t+3) | 34,7M | 5,3% | 18 / 2 / 3 |
+  | B_t1 (t+1..t+6) | 30,5M | 6,5% | 12 / 5 / 3 |
+  | C_t1 (t+1..t+12) | 22,3M | 12,6% | 0 / 11 / 3 |
+
+- Con la ventana t+2 la tasa de positivos sube (A: de 5,3% a 6,5%; B: de 6,5% a 7,5%): casi nadie cae a sit 2 el mes siguiente de estar en sit 1, así que correr la ventana captura más caídas. A cambio, cada target pierde un mes de períodos válidos y B pierde 2 meses de train OOT.
+- Los targets `_t1`, las filas y el split coinciden exactamente con la corrida anterior (2026-11-06).
+
 ## 3. Limitaciones
 
 1. **Target C sin validación fuera de tiempo.** Sus métricas son una cota superior optimista. Como referencia se usa la caída CUIT→OOT observada en A y B.
