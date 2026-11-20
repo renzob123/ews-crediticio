@@ -117,6 +117,15 @@ Regla general: todo lo que se aprende de los datos se ajusta **solo con train**,
 - Con la ventana t+2 la tasa de positivos sube (A: de 5,3% a 6,5%; B: de 6,5% a 7,5%): casi nadie cae a sit 2 el mes siguiente de estar en sit 1, así que correr la ventana captura más caídas. A cambio, cada target pierde un mes de períodos válidos y B pierde 2 meses de train OOT.
 - Los targets `_t1`, las filas y el split coinciden exactamente con la corrida anterior (2026-11-06).
 
+### 2.11 Implementación del modelado (04_modelado.py, 2026-11-19)
+Cada corrida es una combinación de modelo × target × validación × montos × con/sin macro. Elecciones de implementación (se pueden cambiar con parámetros):
+- **Modelo principal: LightGBM** (entre XGBoost y LightGBM se eligió LightGBM porque usa menos memoria y es más rápido con ~25M filas).
+- **Búsqueda de hiperparámetros:** búsqueda aleatoria de 10 configuraciones, GroupKFold(3) por CUIT, early stopping (50 árboles sin mejora) en el fold de validación y PR-AUC como métrica de selección, porque con 7% de positivos es más exigente que el AUC. Por costo, se hace sobre una muestra del 20% de los CUITs de train. El modelo final se entrena con todo train, usando el promedio de árboles de los folds.
+- **Regresión logística:** C = 1 sin tuning (con millones de filas la regularización casi no cambia nada). Montos en log; recorte de extremos en los percentiles 0,5 y 99,5; imputación con mediana más indicador de faltante; escalado y one-hot de sexo y rango de edad. Todo dentro de un Pipeline ajustado solo con train. **Se entrena con el 25% de los CUITs de train**, porque con todas las filas no entra en memoria (16 GB).
+- **Métricas:** por mes de scoring (media ± desvío entre meses), IC 95% con bootstrap Poisson por CUIT (100 réplicas), además de las métricas con todas las filas juntas y con una fila al azar por CUIT.
+- **Validación OOT:** entrena con los CUITs de train en los meses OOT "train" y evalúa con los CUITs de test en los meses OOT "test".
+- **Hallazgo (prueba con 2% de los CUITs):** con una fila al azar por CUIT, la prevalencia de B sube de ~7,7% a ~15,5%. Los que caen en mora salen de sit 1 y aportan menos filas al panel; los buenos pagadores aportan muchas. Con todas las filas pesan más los clientes estables, lo que es coherente con el uso real (cada mes se puntúa a toda la cartera en sit 1).
+
 ## 3. Limitaciones
 
 1. **Target C sin validación fuera de tiempo.** Sus métricas son una cota superior optimista. Como referencia se usa la caída CUIT→OOT observada en A y B.
@@ -146,4 +155,3 @@ Regla general: todo lo que se aprende de los datos se ajusta **solo con train**,
 
 ## 5. Dudas abiertas
 
-- La regresión logística sobre ~28M de filas puede no entrar en memoria. Si pasa, se decidirá si se entrena sobre una muestra de train (por CUIT).
