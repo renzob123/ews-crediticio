@@ -5,7 +5,8 @@ Script 04: Modelado
 Entrena y evalúa un modelo sobre dataset_train.parquet / dataset_test.parquet
 (salidas de 03_split.py). Cada corrida es UNA combinación de:
 
-  --modelo      lightgbm (principal) | logistica (modelo base)
+  --modelo      xgboost (principal) | lightgbm (sensibilidad: otro boosting) |
+                logistica (modelo base)
   --target      target_b (principal) | target_a | target_c | target_*_t1 (sensibilidad
                 de la ventana t+1, duda 1)
   --validacion  cuit: train = CUITs de train, test = CUITs de test
@@ -18,7 +19,7 @@ Entrena y evalúa un modelo sobre dataset_train.parquet / dataset_test.parquet
 
 Metodología (docs/decisiones_metodologicas.md, dudas 4 y 6):
   - Se entrena con todas las filas (una por CUIT × período).
-  - LightGBM: hiperparámetros elegidos con búsqueda aleatoria y GroupKFold por
+  - XGBoost / LightGBM: hiperparámetros elegidos con búsqueda aleatoria y GroupKFold por
     CUIT (todas las filas de un CUIT en el mismo fold), con early stopping en el
     fold de validación. Por costo, la búsqueda se hace sobre una muestra de CUITs
     de train (--frac-tuning); el modelo final se entrena con todo train.
@@ -36,16 +37,17 @@ Metodología (docs/decisiones_metodologicas.md, dudas 4 y 6):
     todas las filas juntas y con una fila al azar por CUIT (robustez).
 
 Salidas en resultados/<corrida>/:
-  metricas.json, metricas_por_mes.csv, importancia.csv, tuning.csv (lightgbm),
-  modelo.txt / modelo.joblib (no van al repo).
+  metricas.json, metricas_por_mes.csv, importancia.csv, tuning.csv (boosting),
+  modelo.json / modelo.txt / modelo.joblib (no van al repo).
 No se guardan scores por CUIT.
 
 Uso:
-  python 04_modelado.py                                   # lightgbm, target_b, cuit, principal, con macro
+  python 04_modelado.py                                   # xgboost, target_b, cuit, principal, con macro
+  python 04_modelado.py --modelo lightgbm
   python 04_modelado.py --modelo logistica
   python 04_modelado.py --validacion oot --sin-macro
   python 04_modelado.py --frac-datos 0.02                 # prueba rápida con 2% de los CUITs
-Requiere: pandas, pyarrow, scikit-learn, lightgbm, joblib
+Requiere: pandas, pyarrow, scikit-learn, xgboost, lightgbm, joblib
 """
 
 import argparse
@@ -57,6 +59,7 @@ from pathlib import Path
 
 import joblib
 import lightgbm as lgb
+import xgboost as xgb
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -116,7 +119,17 @@ NIVELES_MONTO = {"monto_sant_t", "monto_sant_t3", "monto_otras_t", "monto_otras_
                  "monto_otras_t3_real"}
 LOGS_MONTO = {"log_monto_sant", "log_monto_otras", "log_monto_sant_real", "log_monto_otras_real"}
 
-# ── búsqueda de hiperparámetros (LightGBM) ───────────────────────────────────────
+# ── búsqueda de hiperparámetros ──────────────────────────────────────────────────
+# Espacios equivalentes entre los dos boostings (profundidad/hojas, tasa de
+# aprendizaje, mínimo por hoja, submuestreo de columnas y filas, regularización L2)
+ESPACIO_XGB = {
+    "max_depth":        [4, 6, 8, 10],
+    "learning_rate":    [0.05, 0.1],
+    "min_child_weight": [1, 10, 50],     # en unidades de hessiano, no de filas
+    "colsample_bytree": [0.6, 0.8, 1.0],
+    "subsample":        [0.7, 1.0],
+    "reg_lambda":       [1.0, 10.0],
+}
 ESPACIO_LGB = {
     "num_leaves":        [31, 63, 127, 255],
     "learning_rate":     [0.05, 0.1],
@@ -125,6 +138,8 @@ ESPACIO_LGB = {
     "bagging_fraction":  [0.7, 1.0],
     "lambda_l2":         [0.0, 1.0, 10.0],
 }
+ESPACIOS = {"xgboost": ESPACIO_XGB, "lightgbm": ESPACIO_LGB}
+ENTEROS = {"num_leaves", "min_child_samples", "max_depth"}
 MAX_ARBOLES = 3000
 PACIENCIA = 50
 CAPTURAS = (0.05, 0.10, 0.20)
@@ -280,9 +295,33 @@ def peso_positivos(y):
     return float((len(y) - pos) / pos)
 
 
-def tuning_lightgbm(X, y, grupos, n_configs, n_folds):
+def params_boosting(modelo, cfg, spw):
+    if modelo == "xgboost":
+        return {"objective": "binary:logistic", "eval_metric": "aucpr", "tree_method": "hist",
+                "seed": SEED, "scale_pos_weight": spw, "verbosity": 0, **cfg}
+    return {"objective": "binary", "metric": "average_precision", "verbosity": -1,
+            "seed": SEED, "bagging_freq": 1, "scale_pos_weight": spw, **cfg}
+
+
+def ajustar_cv(modelo, cfg, X_tr, y_tr, X_va, y_va):
+    """Entrena con early stopping en el fold de validación: (PR-AUC, árboles)."""
+    params = params_boosting(modelo, cfg, peso_positivos(y_tr))
+    if modelo == "xgboost":
+        dtr = xgb.QuantileDMatrix(X_tr, y_tr, enable_categorical=True)
+        dva = xgb.QuantileDMatrix(X_va, y_va, enable_categorical=True, ref=dtr)
+        m = xgb.train(params, dtr, MAX_ARBOLES, evals=[(dva, "valid")],
+                      early_stopping_rounds=PACIENCIA, verbose_eval=False)
+        return m.best_score, m.best_iteration + 1
+    dtr = lgb.Dataset(X_tr, y_tr)
+    dva = lgb.Dataset(X_va, y_va, reference=dtr)
+    m = lgb.train(params, dtr, MAX_ARBOLES, valid_sets=[dva],
+                  callbacks=[lgb.early_stopping(PACIENCIA, verbose=False)])
+    return m.best_score["valid_0"]["average_precision"], m.best_iteration
+
+
+def tuning_boosting(modelo, X, y, grupos, n_configs, n_folds):
     rng = np.random.default_rng(SEED)
-    configs = [{k: v[rng.integers(len(v))] for k, v in ESPACIO_LGB.items()}
+    configs = [{k: v[rng.integers(len(v))] for k, v in ESPACIOS[modelo].items()}
                for _ in range(n_configs)]
     folds = list(GroupKFold(n_splits=n_folds, shuffle=True, random_state=SEED)
                  .split(X, y, groups=grupos))
@@ -290,15 +329,9 @@ def tuning_lightgbm(X, y, grupos, n_configs, n_folds):
     for i, cfg in enumerate(configs, 1):
         aps, iters = [], []
         for tr, va in folds:
-            params = {"objective": "binary", "metric": "average_precision", "verbosity": -1,
-                      "seed": SEED, "bagging_freq": 1,
-                      "scale_pos_weight": peso_positivos(y[tr]), **cfg}
-            dtr = lgb.Dataset(X.iloc[tr], y[tr])
-            dva = lgb.Dataset(X.iloc[va], y[va], reference=dtr)
-            m = lgb.train(params, dtr, MAX_ARBOLES, valid_sets=[dva],
-                          callbacks=[lgb.early_stopping(PACIENCIA, verbose=False)])
-            aps.append(m.best_score["valid_0"]["average_precision"])
-            iters.append(m.best_iteration)
+            ap_, it = ajustar_cv(modelo, cfg, X.iloc[tr], y[tr], X.iloc[va], y[va])
+            aps.append(ap_)
+            iters.append(it)
         filas.append({**cfg, "pr_auc_cv": float(np.mean(aps)), "pr_auc_cv_sd": float(np.std(aps)),
                       "arboles": int(np.mean(iters))})
         print(f"  config {i}/{n_configs}: PR-AUC {np.mean(aps):.4f} ± {np.std(aps):.4f}"
@@ -309,7 +342,7 @@ def tuning_lightgbm(X, y, grupos, n_configs, n_folds):
 # ── main ──────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--modelo", choices=["lightgbm", "logistica"], default="lightgbm")
+    ap.add_argument("--modelo", choices=["xgboost", "lightgbm", "logistica"], default="xgboost")
     ap.add_argument("--target", default="target_b",
                     choices=[f"target_{t}{s}" for s in ("", "_t1") for t in "abc"])
     ap.add_argument("--validacion", choices=["cuit", "oot"], default="cuit")
@@ -321,7 +354,7 @@ def main():
                     help="fracción de los CUITs de train para la búsqueda de hiperparámetros")
     ap.add_argument("--frac-logistica", type=float, default=0.25,
                     help="fracción de los CUITs de train para entrenar la logística")
-    ap.add_argument("--configs", type=int, default=10, help="configuraciones a probar (lightgbm)")
+    ap.add_argument("--configs", type=int, default=10, help="configuraciones a probar (boosting)")
     ap.add_argument("--folds", type=int, default=3)
     ap.add_argument("--bootstrap", type=int, default=100)
     args = ap.parse_args()
@@ -357,35 +390,48 @@ def main():
                            "prevalencia": float(y_tr.mean())}}
 
     # ── entrenamiento ──
-    if args.modelo == "lightgbm":
+    if args.modelo in ("xgboost", "lightgbm"):
         sub = muestra_cuits(tr["cuit"].to_numpy(), args.frac_tuning, "tuning")
         print(f"\n[2] Búsqueda de hiperparámetros: {args.configs} configs × GroupKFold({args.folds}) "
               f"por CUIT sobre {sub.sum():,} filas...")
-        tuning = tuning_lightgbm(tr.loc[sub, features].reset_index(drop=True), y_tr[sub],
-                                 tr.loc[sub, "cuit"].to_numpy(), args.configs, args.folds)
+        tuning = tuning_boosting(args.modelo, tr.loc[sub, features].reset_index(drop=True),
+                                 y_tr[sub], tr.loc[sub, "cuit"].to_numpy(),
+                                 args.configs, args.folds)
         tuning.to_csv(out / "tuning.csv", index=False)
         mejor = tuning.iloc[0].to_dict()
         arboles = int(mejor.pop("arboles"))
         mejor.pop("pr_auc_cv"); mejor.pop("pr_auc_cv_sd")
-        mejor = {k: (int(v) if k in ("num_leaves", "min_child_samples") else float(v))
-                 for k, v in mejor.items()}
+        mejor = {k: (int(v) if k in ENTEROS else float(v)) for k, v in mejor.items()}
         print(f"  Mejor: {mejor}, {arboles} árboles")
 
         print(f"\n[3] Entrenando el modelo final con todo train...")
-        params = {"objective": "binary", "verbosity": -1, "seed": SEED, "bagging_freq": 1,
-                  "scale_pos_weight": peso_positivos(y_tr), **mejor}
-        dtr = lgb.Dataset(tr[features], y_tr, free_raw_data=True)
-        del tr; gc.collect()
-        modelo = lgb.train(params, dtr, arboles)
-        del dtr; gc.collect()
-        modelo.save_model(str(out / "modelo.txt"))
-        imp = pd.DataFrame({"variable": modelo.feature_name(),
-                            "ganancia": modelo.feature_importance("gain"),
-                            "splits": modelo.feature_importance("split")})
+        params = params_boosting(args.modelo, mejor, peso_positivos(y_tr))
+        if args.modelo == "xgboost":
+            # QuantileDMatrix guarda los datos ya discretizados (~1 byte por valor)
+            dtr = xgb.QuantileDMatrix(tr[features], y_tr, enable_categorical=True)
+            del tr; gc.collect()
+            modelo = xgb.train(params, dtr, arboles)
+            del dtr; gc.collect()
+            modelo.save_model(str(out / "modelo.json"))
+            gan = modelo.get_score(importance_type="total_gain")
+            spl = modelo.get_score(importance_type="weight")
+            imp = pd.DataFrame({"variable": features,
+                                "ganancia": [gan.get(f, 0.0) for f in features],
+                                "splits": [spl.get(f, 0) for f in features]})
+            predecir = lambda X: modelo.predict(xgb.DMatrix(X, enable_categorical=True))
+        else:
+            dtr = lgb.Dataset(tr[features], y_tr, free_raw_data=True)
+            del tr; gc.collect()
+            modelo = lgb.train(params, dtr, arboles)
+            del dtr; gc.collect()
+            modelo.save_model(str(out / "modelo.txt"))
+            imp = pd.DataFrame({"variable": modelo.feature_name(),
+                                "ganancia": modelo.feature_importance("gain"),
+                                "splits": modelo.feature_importance("split")})
+            predecir = lambda X: modelo.predict(X)
         imp["ganancia_pct"] = imp["ganancia"] / imp["ganancia"].sum() * 100
         imp.sort_values("ganancia", ascending=False).to_csv(out / "importancia.csv", index=False)
         resultado["hiperparametros"] = {**mejor, "arboles": arboles}
-        predecir = lambda X: modelo.predict(X)
     else:
         print(f"\n[2] Entrenando regresión logística (Pipeline ajustado solo con train)...")
         modelo = pipeline_logistica(features)
