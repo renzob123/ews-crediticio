@@ -161,21 +161,27 @@ def muestra_cuits(cuit: np.ndarray, frac: float, uso: str = "datos") -> np.ndarr
 
 
 def cargar(path: Path, columnas: list, target: str, oot_col: str | None,
-           oot_valor: str | None, frac: float) -> pd.DataFrame:
+           oot_valor: str | None, frac: float, frac_tuning: float | None = None) -> pd.DataFrame:
     """
     Lee por bloques solo las columnas necesarias, las filas con el target válido
-    (y en el tramo OOT pedido) y la fracción de CUITs pedida. El CUIT pasa a
-    entero para no cargar millones de strings.
+    (y en el tramo OOT pedido) y la fracción de CUITs pedida (y, si se pide, solo
+    la muestra de CUITs de tuning). El CUIT pasa a entero para no cargar millones
+    de strings.
+    Memoria: se lee de a un bloque por vez (sin lectura anticipada) y la
+    conversión a pandas libera la tabla de Arrow a medida que avanza.
     """
     leer = ["cuit", "periodo", target, *columnas] + ([oot_col] if oot_col else [])
     escaner = ds.dataset(path).scanner(columns=leer, filter=ds.field(target).is_valid(),
-                                       batch_size=1_000_000)
+                                       batch_size=500_000, batch_readahead=1,
+                                       fragment_readahead=1)
     partes = []
     for lote in escaner.to_batches():
         if lote.num_rows == 0:
             continue
         cuit = pc.cast(lote.column("cuit"), pa.int64()).to_numpy()
         keep = muestra_cuits(cuit, frac)
+        if frac_tuning is not None:
+            keep &= muestra_cuits(cuit, frac_tuning, "tuning")
         if oot_col:
             keep &= pc.equal(pc.cast(lote.column(oot_col), pa.string()), oot_valor) \
                       .to_numpy(zero_copy_only=False)
@@ -189,7 +195,10 @@ def cargar(path: Path, columnas: list, target: str, oot_col: str | None,
     if not partes:
         return pd.DataFrame(columns=leer)
     # sin los metadatos de pandas del parquet, que volverían a convertir cuit en texto
-    df = pa.concat_tables(partes).replace_schema_metadata(None).to_pandas()
+    tabla = pa.concat_tables(partes).replace_schema_metadata(None).combine_chunks()
+    del partes
+    df = tabla.to_pandas(self_destruct=True, split_blocks=True)
+    del tabla
     for c in CATEGORICAS:
         if c in df:
             df[c] = df[c].astype("category")
@@ -354,7 +363,7 @@ def main():
                     help="fracción de los CUITs de train para la búsqueda de hiperparámetros")
     ap.add_argument("--frac-logistica", type=float, default=0.25,
                     help="fracción de los CUITs de train para entrenar la logística")
-    ap.add_argument("--configs", type=int, default=10, help="configuraciones a probar (boosting)")
+    ap.add_argument("--configs", type=int, default=6, help="configuraciones a probar (boosting)")
     ap.add_argument("--folds", type=int, default=3)
     ap.add_argument("--bootstrap", type=int, default=100)
     args = ap.parse_args()
@@ -373,30 +382,32 @@ def main():
     print("=" * 64)
     print(f"  {len(features)} variables")
 
-    # ── train ──
-    frac_train = args.frac_datos * (args.frac_logistica if args.modelo == "logistica" else 1.0)
-    print(f"\n[1] Cargando train (fracción de CUITs {frac_train:g})...")
-    tr = cargar(TRAIN, features, args.target, oot_col, "train", frac_train)
-    if tr.empty:
-        print(f"ERROR: no hay filas de train para {args.target} con validación {args.validacion}.")
-        sys.exit(1)
-    y_tr = tr[args.target].to_numpy()
-    print(f"  {len(tr):,} filas, {tr['cuit'].nunique():,} CUITs, "
-          f"períodos {tr['periodo'].min()}-{tr['periodo'].max()}, positivos {y_tr.mean()*100:.2f}%")
+    boosting = args.modelo in ("xgboost", "lightgbm")
 
-    resultado = {"corrida": nombre, "args": vars(args), "features": features,
-                 "train": {"filas": len(tr), "cuits": int(tr["cuit"].nunique()),
-                           "periodos": [int(tr["periodo"].min()), int(tr["periodo"].max())],
-                           "prevalencia": float(y_tr.mean())}}
+    def cargar_train(frac, frac_tuning=None):
+        df = cargar(TRAIN, features, args.target, oot_col, "train", frac, frac_tuning)
+        if df.empty:
+            print(f"ERROR: no hay filas de train para {args.target} con validación {args.validacion}.")
+            sys.exit(1)
+        y = df[args.target].to_numpy()
+        print(f"  {len(df):,} filas, {df['cuit'].nunique():,} CUITs, "
+              f"períodos {df['periodo'].min()}-{df['periodo'].max()}, positivos {y.mean()*100:.2f}%")
+        return df, y
 
-    # ── entrenamiento ──
-    if args.modelo in ("xgboost", "lightgbm"):
-        sub = muestra_cuits(tr["cuit"].to_numpy(), args.frac_tuning, "tuning")
+    resultado = {"corrida": nombre, "args": vars(args), "features": features}
+
+    # ── búsqueda de hiperparámetros (solo boosting), con su muestra de CUITs ──
+    # Se carga solo la muestra de tuning y se libera antes de cargar todo train,
+    # para no tener las dos cosas en memoria a la vez.
+    if boosting:
+        print(f"\n[1] Cargando la muestra de tuning ({args.frac_tuning:g} de los CUITs de train)...")
+        sub, y_sub = cargar_train(args.frac_datos, args.frac_tuning)
         print(f"\n[2] Búsqueda de hiperparámetros: {args.configs} configs × GroupKFold({args.folds}) "
-              f"por CUIT sobre {sub.sum():,} filas...")
-        tuning = tuning_boosting(args.modelo, tr.loc[sub, features].reset_index(drop=True),
-                                 y_tr[sub], tr.loc[sub, "cuit"].to_numpy(),
-                                 args.configs, args.folds)
+              f"por CUIT...")
+        grupos = sub["cuit"].to_numpy()
+        sub.drop(columns=["cuit", "periodo", args.target], inplace=True)   # sin copiar
+        tuning = tuning_boosting(args.modelo, sub, y_sub, grupos, args.configs, args.folds)
+        del sub, y_sub; gc.collect()
         tuning.to_csv(out / "tuning.csv", index=False)
         mejor = tuning.iloc[0].to_dict()
         arboles = int(mejor.pop("arboles"))
@@ -404,11 +415,22 @@ def main():
         mejor = {k: (int(v) if k in ENTEROS else float(v)) for k, v in mejor.items()}
         print(f"  Mejor: {mejor}, {arboles} árboles")
 
-        print(f"\n[3] Entrenando el modelo final con todo train...")
+    # ── train ──
+    frac_train = args.frac_datos * (1.0 if boosting else args.frac_logistica)
+    print(f"\n[{3 if boosting else 1}] Cargando train (fracción de CUITs {frac_train:g})...")
+    tr, y_tr = cargar_train(frac_train)
+    resultado["train"] = {"filas": len(tr), "cuits": int(tr["cuit"].nunique()),
+                          "periodos": [int(tr["periodo"].min()), int(tr["periodo"].max())],
+                          "prevalencia": float(y_tr.mean())}
+    tr.drop(columns=["cuit", "periodo", args.target], inplace=True)   # quedan solo las variables
+
+    # ── entrenamiento ──
+    if boosting:
+        print(f"\n[4] Entrenando el modelo final con todo train...")
         params = params_boosting(args.modelo, mejor, peso_positivos(y_tr))
         if args.modelo == "xgboost":
             # QuantileDMatrix guarda los datos ya discretizados (~1 byte por valor)
-            dtr = xgb.QuantileDMatrix(tr[features], y_tr, enable_categorical=True)
+            dtr = xgb.QuantileDMatrix(tr, y_tr, enable_categorical=True)
             del tr; gc.collect()
             modelo = xgb.train(params, dtr, arboles)
             del dtr; gc.collect()
@@ -420,7 +442,7 @@ def main():
                                 "splits": [spl.get(f, 0) for f in features]})
             predecir = lambda X: modelo.predict(xgb.DMatrix(X, enable_categorical=True))
         else:
-            dtr = lgb.Dataset(tr[features], y_tr, free_raw_data=True)
+            dtr = lgb.Dataset(tr, y_tr, free_raw_data=True)
             del tr; gc.collect()
             modelo = lgb.train(params, dtr, arboles)
             del dtr; gc.collect()
@@ -435,7 +457,7 @@ def main():
     else:
         print(f"\n[2] Entrenando regresión logística (Pipeline ajustado solo con train)...")
         modelo = pipeline_logistica(features)
-        modelo.fit(tr[features], y_tr)
+        modelo.fit(tr, y_tr)
         del tr; gc.collect()
         joblib.dump(modelo, out / "modelo.joblib")
         nombres = modelo.named_steps["pre"].get_feature_names_out()
@@ -446,7 +468,7 @@ def main():
         predecir = lambda X: modelo.predict_proba(X)[:, 1]
 
     # ── test (una sola vez) ──
-    print(f"\n[4] Evaluando en test...")
+    print(f"\n[5] Evaluando en test...")
     te = cargar(TEST, features, args.target, oot_col, "test", args.frac_datos)
     y_te, per_te, cuit_te = te[args.target].to_numpy(), te["periodo"].to_numpy(), te["cuit"].to_numpy()
     p_te = predecir(te[features])
@@ -462,7 +484,7 @@ def main():
     una_fila = pd.DataFrame({"cuit": cuit_te, "r": rng.random(len(cuit_te))}) \
         .groupby("cuit")["r"].idxmin().to_numpy()
 
-    print(f"\n[5] Bootstrap por CUIT ({args.bootstrap} réplicas)...")
+    print(f"\n[6] Bootstrap por CUIT ({args.bootstrap} réplicas)...")
     ic = bootstrap_cuit(y_te, p_te, per_te, cuit_te, args.bootstrap) if args.bootstrap else {}
 
     resultado["test"] = {
