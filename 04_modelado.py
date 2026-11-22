@@ -53,7 +53,9 @@ Requiere: pandas, pyarrow, scikit-learn, xgboost, lightgbm, joblib
 import argparse
 import gc
 import json
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -95,6 +97,9 @@ BASE = [
     "meses_con_deuda_sistema_3m", "meses_con_deuda_sistema_6m", "deuda_sistema_t5",
 ]
 CATEGORICAS = ["sexo_proxy", "rango_edad_proxy"]
+# categorías fijas (las mismas en train, test y en cada bloque de lectura)
+CATEGORIAS = {"sexo_proxy": ["F", "I", "M"],
+              "rango_edad_proxy": ["18_30", "30_50", "50_65", "65_mas"]}
 MONTOS_NOMINAL = ["monto_sant_t", "monto_sant_t3", "var_monto_3m_sant", "log_monto_sant",
                   "monto_otras_t", "monto_otras_t3", "log_monto_otras"]
 MONTOS_REAL = ["monto_sant_t_real", "monto_sant_t3_real", "var_monto_3m_sant_real",
@@ -160,21 +165,17 @@ def muestra_cuits(cuit: np.ndarray, frac: float, uso: str = "datos") -> np.ndarr
     return ((cuit // 10) % mod) < frac * mod    # // 10 descarta el dígito verificador
 
 
-def cargar(path: Path, columnas: list, target: str, oot_col: str | None,
-           oot_valor: str | None, frac: float, frac_tuning: float | None = None) -> pd.DataFrame:
+def lotes_filtrados(path: Path, leer: list, target: str, oot_col: str | None,
+                    oot_valor: str | None, frac: float, frac_tuning: float | None = None):
     """
-    Lee por bloques solo las columnas necesarias, las filas con el target válido
-    (y en el tramo OOT pedido) y la fracción de CUITs pedida (y, si se pide, solo
-    la muestra de CUITs de tuning). El CUIT pasa a entero para no cargar millones
-    de strings.
-    Memoria: se lee de a un bloque por vez (sin lectura anticipada) y la
-    conversión a pandas libera la tabla de Arrow a medida que avanza.
+    Recorre el parquet de a un bloque (sin lectura anticipada) y devuelve cada
+    bloque como tabla de Arrow con solo las filas con el target válido, en el
+    tramo OOT pedido y en la fracción de CUITs pedida (y, si se pide, solo la
+    muestra de tuning). El CUIT pasa a entero para no cargar millones de strings.
     """
-    leer = ["cuit", "periodo", target, *columnas] + ([oot_col] if oot_col else [])
     escaner = ds.dataset(path).scanner(columns=leer, filter=ds.field(target).is_valid(),
                                        batch_size=500_000, batch_readahead=1,
                                        fragment_readahead=1)
-    partes = []
     for lote in escaner.to_batches():
         if lote.num_rows == 0:
             continue
@@ -191,19 +192,142 @@ def cargar(path: Path, columnas: list, target: str, oot_col: str | None,
         tabla = tabla.set_column(0, "cuit", pc.cast(tabla.column("cuit"), pa.int64()))
         if oot_col:
             tabla = tabla.drop_columns([oot_col])
-        partes.append(tabla)
-    if not partes:
-        return pd.DataFrame(columns=leer)
-    # sin los metadatos de pandas del parquet, que volverían a convertir cuit en texto
-    tabla = pa.concat_tables(partes).replace_schema_metadata(None).combine_chunks()
-    del partes
-    df = tabla.to_pandas(self_destruct=True, split_blocks=True)
-    del tabla
+        del lote
+        yield tabla
+
+
+def fijar_tipos(df: pd.DataFrame, target: str) -> pd.DataFrame:
     for c in CATEGORICAS:
         if c in df:
-            df[c] = df[c].astype("category")
+            nulos = df[c].isna().sum()
+            df[c] = df[c].astype(pd.CategoricalDtype(CATEGORIAS[c]))
+            if df[c].isna().sum() != nulos:
+                raise ValueError(f"{c} tiene valores fuera de CATEGORIAS")
     df[target] = df[target].astype("int8")
     return df
+
+
+def a_pandas(tabla: pa.Table) -> pd.DataFrame:
+    # sin los metadatos de pandas del parquet, que volverían a convertir cuit en texto
+    return tabla.replace_schema_metadata(None).to_pandas()
+
+
+def cargar(path: Path, columnas: list, target: str, oot_col: str | None,
+           oot_valor: str | None, frac: float, frac_tuning: float | None = None) -> pd.DataFrame:
+    """
+    Carga en un DataFrame los bloques de lotes_filtrados. Se arma columna por
+    columna, liberando los bloques de Arrow de cada columna a medida que pasa a
+    pandas, para no tener dos copias completas de los datos.
+    """
+    leer = ["cuit", "periodo", target, *columnas] + ([oot_col] if oot_col else [])
+    partes = {}   # columna → bloques de Arrow ya filtrados
+    for tabla in lotes_filtrados(path, leer, target, oot_col, oot_valor, frac, frac_tuning):
+        for c in tabla.column_names:
+            partes.setdefault(c, []).extend(tabla.column(c).chunks)
+        del tabla
+    if not partes:
+        return pd.DataFrame(columns=leer)
+    columnas_df = {}
+    for c in list(partes):
+        trozos = partes.pop(c)
+        columnas_df[c] = pa.chunked_array(trozos).to_pandas()
+        del trozos
+    df = pd.DataFrame(columnas_df, copy=False)
+    del columnas_df
+    return fijar_tipos(df, target)
+
+
+class IterTrain(xgb.DataIter):
+    """
+    Entrega train a XGBoost de a un bloque del parquet para armar una matriz en
+    memoria externa (ExtMemQuantileDMatrix): XGBoost guarda las páginas ya
+    discretizadas en disco (cache_dir) y las lee durante el entrenamiento.
+    Con todo train el pico es ~3,4 GB; armar la matriz en memoria desde un
+    DataFrame superaba los 8 GB. En la primera pasada junta los datos
+    descriptivos de train (filas, CUITs, períodos, positivos).
+    """
+    def __init__(self, path, features, target, oot_col, oot_valor, frac, cache_dir):
+        self.features, self.target = features, target
+        self.leer = ["cuit", "periodo", target, *features] + ([oot_col] if oot_col else [])
+        self.args = (path, self.leer, target, oot_col, oot_valor, frac)
+        self._gen = None
+        self.pasadas = 0
+        self._cuits, self._pos, self._filas, self._per = [], 0, 0, [np.inf, -np.inf]
+        self.stats = None
+        super().__init__(cache_prefix=str(Path(cache_dir) / "train"), release_data=True,
+                         on_host=False)
+
+    def reset(self):
+        if self._gen is not None and self.stats is None:
+            self._cerrar_stats()
+        self._gen = None
+
+    def _cerrar_stats(self):
+        cuits = np.unique(np.concatenate(self._cuits)) if self._cuits else np.array([])
+        self.stats = {"filas": int(self._filas), "cuits": int(len(cuits)),
+                      "periodos": [int(self._per[0]), int(self._per[1])],
+                      "positivos": int(self._pos),
+                      "prevalencia": float(self._pos / self._filas) if self._filas else float("nan")}
+        self._cuits = []
+
+    def next(self, input_data):
+        if self._gen is None:
+            self._gen = lotes_filtrados(*self.args)
+            self.pasadas += 1
+        try:
+            tabla = next(self._gen)
+        except StopIteration:
+            return False
+        df = fijar_tipos(a_pandas(tabla), self.target)
+        del tabla
+        y = df[self.target].to_numpy()
+        if self.stats is None:
+            self._cuits.append(np.unique(df["cuit"].to_numpy()))
+            self._pos += int(y.sum()); self._filas += len(y)
+            self._per = [min(self._per[0], df["periodo"].min()), max(self._per[1], df["periodo"].max())]
+        input_data(data=df[self.features], label=y)
+        return True
+
+
+def a_matriz(df: pd.DataFrame, features: list) -> np.ndarray:
+    """Variables como matriz float32 (categóricas como su código; faltantes = NaN)."""
+    X = np.empty((len(df), len(features)), dtype=np.float32)
+    for j, c in enumerate(features):
+        if c in CATEGORICAS:
+            cod = df[c].cat.codes.to_numpy().astype(np.float32)
+            cod[cod < 0] = np.nan
+            X[:, j] = cod
+        else:
+            X[:, j] = df[c].to_numpy(dtype=np.float32, na_value=np.nan)
+    return X
+
+
+def train_en_disco(path, features, target, oot_col, oot_valor, frac, archivo):
+    """
+    Escribe las variables de train de a bloques en un archivo binario float32 y
+    lo devuelve abierto como memory-map, junto con el target y los datos
+    descriptivos de train. El sistema operativo lee el archivo a demanda, así
+    que todo train nunca ocupa RAM a la vez (para LightGBM con todo train).
+    """
+    leer = ["cuit", "periodo", target, *features] + ([oot_col] if oot_col else [])
+    ys, cuits, filas, per = [], [], 0, [np.inf, -np.inf]
+    with open(archivo, "wb") as f:
+        for tabla in lotes_filtrados(path, leer, target, oot_col, oot_valor, frac):
+            df = fijar_tipos(a_pandas(tabla), target)
+            del tabla
+            f.write(a_matriz(df, features).tobytes())
+            ys.append(df[target].to_numpy())
+            cuits.append(np.unique(df["cuit"].to_numpy()))
+            filas += len(df)
+            per = [min(per[0], df["periodo"].min()), max(per[1], df["periodo"].max())]
+            del df
+    y = np.concatenate(ys) if ys else np.array([], dtype=np.int8)
+    stats = {"filas": int(filas), "cuits": int(len(np.unique(np.concatenate(cuits)))) if cuits else 0,
+             "periodos": [int(per[0]), int(per[1])] if filas else [0, 0],
+             "positivos": int(y.sum()),
+             "prevalencia": float(y.mean()) if filas else float("nan")}
+    X = np.memmap(archivo, dtype=np.float32, mode="r", shape=(filas, len(features))) if filas else None
+    return X, y, stats
 
 
 # ── métricas ──────────────────────────────────────────────────────────────────────
@@ -366,6 +490,8 @@ def main():
     ap.add_argument("--configs", type=int, default=6, help="configuraciones a probar (boosting)")
     ap.add_argument("--folds", type=int, default=3)
     ap.add_argument("--bootstrap", type=int, default=100)
+    ap.add_argument("--reusar-tuning", action="store_true",
+                    help="usar el tuning.csv ya guardado de esta corrida en vez de repetir la búsqueda")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -399,41 +525,80 @@ def main():
     # ── búsqueda de hiperparámetros (solo boosting), con su muestra de CUITs ──
     # Se carga solo la muestra de tuning y se libera antes de cargar todo train,
     # para no tener las dos cosas en memoria a la vez.
-    if boosting:
+    if boosting and args.reusar_tuning and (out / "tuning.csv").exists():
+        print(f"\n[1-2] Reutilizando la búsqueda de hiperparámetros guardada en {out / 'tuning.csv'}")
+        tuning = pd.read_csv(out / "tuning.csv")
+    elif boosting:
         print(f"\n[1] Cargando la muestra de tuning ({args.frac_tuning:g} de los CUITs de train)...")
         sub, y_sub = cargar_train(args.frac_datos, args.frac_tuning)
         print(f"\n[2] Búsqueda de hiperparámetros: {args.configs} configs × GroupKFold({args.folds}) "
               f"por CUIT...")
         grupos = sub["cuit"].to_numpy()
-        sub.drop(columns=["cuit", "periodo", args.target], inplace=True)   # sin copiar
+        sub = sub.drop(columns=["cuit", "periodo", args.target])   # sin copia (copy-on-write)
         tuning = tuning_boosting(args.modelo, sub, y_sub, grupos, args.configs, args.folds)
         del sub, y_sub; gc.collect()
         tuning.to_csv(out / "tuning.csv", index=False)
-        mejor = tuning.iloc[0].to_dict()
+    if boosting:
+        mejor = tuning.sort_values("pr_auc_cv", ascending=False).iloc[0].to_dict()
         arboles = int(mejor.pop("arboles"))
         mejor.pop("pr_auc_cv"); mejor.pop("pr_auc_cv_sd")
         mejor = {k: (int(v) if k in ENTEROS else float(v)) for k, v in mejor.items()}
         print(f"  Mejor: {mejor}, {arboles} árboles")
 
     # ── train ──
-    frac_train = args.frac_datos * (1.0 if boosting else args.frac_logistica)
-    print(f"\n[{3 if boosting else 1}] Cargando train (fracción de CUITs {frac_train:g})...")
-    tr, y_tr = cargar_train(frac_train)
-    resultado["train"] = {"filas": len(tr), "cuits": int(tr["cuit"].nunique()),
-                          "periodos": [int(tr["periodo"].min()), int(tr["periodo"].max())],
-                          "prevalencia": float(y_tr.mean())}
-    tr.drop(columns=["cuit", "periodo", args.target], inplace=True)   # quedan solo las variables
+    if args.modelo == "xgboost":
+        # XGBoost lee train de a bloques directo al QuantileDMatrix (ver IterTrain)
+        print(f"\n[3] Armando la matriz de train en memoria externa (fracción de CUITs "
+              f"{args.frac_datos:g})...")
+        cache_dir = tempfile.mkdtemp(prefix="xgb_cache_")   # se borra al terminar de entrenar
+        it = IterTrain(TRAIN, features, args.target, oot_col, "train" if oot_col else None,
+                       args.frac_datos, cache_dir)
+        dtr = xgb.ExtMemQuantileDMatrix(it, enable_categorical=True)
+        if it.stats is None:
+            it._cerrar_stats()
+        st = it.stats
+        del it; gc.collect()
+        if st["filas"] == 0:
+            print(f"ERROR: no hay filas de train para {args.target} con validación {args.validacion}.")
+            sys.exit(1)
+        print(f"  {st['filas']:,} filas, {st['cuits']:,} CUITs, períodos {st['periodos'][0]}-"
+              f"{st['periodos'][1]}, positivos {st['prevalencia']*100:.2f}%")
+        resultado["train"] = {k: st[k] for k in ("filas", "cuits", "periodos", "prevalencia")}
+        spw = (st["filas"] - st["positivos"]) / st["positivos"]
+    elif args.modelo == "lightgbm":
+        # LightGBM arma su Dataset desde un memory-map en disco (ver train_en_disco)
+        print(f"\n[3] Escribiendo train a disco por bloques (fracción de CUITs {args.frac_datos:g})...")
+        cache_dir = tempfile.mkdtemp(prefix="lgb_cache_")   # se borra al terminar de entrenar
+        X_tr, y_tr, st = train_en_disco(TRAIN, features, args.target, oot_col,
+                                        "train" if oot_col else None, args.frac_datos,
+                                        Path(cache_dir) / "train.f32")
+        if st["filas"] == 0:
+            print(f"ERROR: no hay filas de train para {args.target} con validación {args.validacion}.")
+            sys.exit(1)
+        print(f"  {st['filas']:,} filas, {st['cuits']:,} CUITs, períodos {st['periodos'][0]}-"
+              f"{st['periodos'][1]}, positivos {st['prevalencia']*100:.2f}%")
+        resultado["train"] = {k: st[k] for k in ("filas", "cuits", "periodos", "prevalencia")}
+        spw = (st["filas"] - st["positivos"]) / st["positivos"]
+    else:
+        frac_train = args.frac_datos * (1.0 if boosting else args.frac_logistica)
+        print(f"\n[{3 if boosting else 1}] Cargando train (fracción de CUITs {frac_train:g})...")
+        tr, y_tr = cargar_train(frac_train)
+        resultado["train"] = {"filas": len(tr), "cuits": int(tr["cuit"].nunique()),
+                              "periodos": [int(tr["periodo"].min()), int(tr["periodo"].max())],
+                              "prevalencia": float(y_tr.mean())}
+        tr = tr.drop(columns=["cuit", "periodo", args.target])   # quedan solo las variables
+        spw = peso_positivos(y_tr)
 
     # ── entrenamiento ──
     if boosting:
         print(f"\n[4] Entrenando el modelo final con todo train...")
-        params = params_boosting(args.modelo, mejor, peso_positivos(y_tr))
+        params = params_boosting(args.modelo, mejor, spw)
         if args.modelo == "xgboost":
-            # QuantileDMatrix guarda los datos ya discretizados (~1 byte por valor)
-            dtr = xgb.QuantileDMatrix(tr, y_tr, enable_categorical=True)
-            del tr; gc.collect()
-            modelo = xgb.train(params, dtr, arboles)
-            del dtr; gc.collect()
+            try:
+                modelo = xgb.train(params, dtr, arboles)
+            finally:
+                del dtr; gc.collect()
+                shutil.rmtree(cache_dir, ignore_errors=True)
             modelo.save_model(str(out / "modelo.json"))
             gan = modelo.get_score(importance_type="total_gain")
             spl = modelo.get_score(importance_type="weight")
@@ -442,15 +607,22 @@ def main():
                                 "splits": [spl.get(f, 0) for f in features]})
             predecir = lambda X: modelo.predict(xgb.DMatrix(X, enable_categorical=True))
         else:
-            dtr = lgb.Dataset(tr, y_tr, free_raw_data=True)
-            del tr; gc.collect()
-            modelo = lgb.train(params, dtr, arboles)
-            del dtr; gc.collect()
+            try:
+                dtr = lgb.Dataset(X_tr, y_tr, feature_name=features,
+                                  categorical_feature=[c for c in features if c in CATEGORICAS],
+                                  free_raw_data=True)
+                modelo = lgb.train(params, dtr, arboles)
+            finally:
+                dtr = X_tr = None; gc.collect()   # cerrar el memory-map antes de borrar
+                shutil.rmtree(cache_dir, ignore_errors=True)
             modelo.save_model(str(out / "modelo.txt"))
             imp = pd.DataFrame({"variable": modelo.feature_name(),
                                 "ganancia": modelo.feature_importance("gain"),
                                 "splits": modelo.feature_importance("split")})
-            predecir = lambda X: modelo.predict(X)
+            # se predice de a tramos con la misma codificación que en el entrenamiento
+            predecir = lambda X: np.concatenate(
+                [modelo.predict(a_matriz(X.iloc[i:i + 1_000_000], features))
+                 for i in range(0, len(X), 1_000_000)])
         imp["ganancia_pct"] = imp["ganancia"] / imp["ganancia"].sum() * 100
         imp.sort_values("ganancia", ascending=False).to_csv(out / "importancia.csv", index=False)
         resultado["hiperparametros"] = {**mejor, "arboles": arboles}
