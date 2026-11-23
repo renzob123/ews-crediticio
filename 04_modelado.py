@@ -30,7 +30,8 @@ Metodología (docs/decisiones_metodologicas.md, dudas 4 y 6):
   - Desbalance: peso de clase (scale_pos_weight / class_weight="balanced"),
     sin remuestreo. Las métricas usan la prevalencia real.
   - El test se usa una sola vez, al final.
-  - Métricas por mes de scoring t (AUC, PR-AUC, captura en el top 5/10/20%),
+  - Métricas por mes de scoring t (AUC, Gini, PR-AUC; captura, precisión y lift en
+    el top 5/10/20%; calibración: Brier y probabilidad media sobre tasa observada),
     reportadas como media ± desvío entre meses, con intervalos de confianza por
     bootstrap por CUIT (Poisson: cada CUIT recibe un peso ~ Poisson(1), que
     equivale a remuestrear CUITs con todas sus filas). Además: métricas sobre
@@ -332,28 +333,46 @@ def train_en_disco(path, features, target, oot_col, oot_valor, frac, archivo):
 
 # ── métricas ──────────────────────────────────────────────────────────────────────
 def capturas(y, p, w):
-    """% de los positivos (ponderados) que caen en el top X% de scores."""
+    """
+    Para el top X% de scores (ponderado): captura (% de los positivos que caen
+    ahí), precisión (% de positivos dentro del top) y lift (precisión sobre la
+    prevalencia; 1 = elegir al azar).
+    """
     orden = np.argsort(-p, kind="stable")
     w_ord, pos_ord = w[orden], (y[orden] * w[orden])
     cum_w, cum_pos = np.cumsum(w_ord), np.cumsum(pos_ord)
     total_w, total_pos = cum_w[-1], cum_pos[-1]
     out = {}
     for x in CAPTURAS:
-        k = np.searchsorted(cum_w, x * total_w, side="right")
-        out[f"captura_top{int(x*100)}"] = float(cum_pos[min(k, len(cum_pos) - 1)] / total_pos) \
-            if total_pos > 0 else np.nan
+        j = min(np.searchsorted(cum_w, x * total_w, side="right"), len(cum_pos) - 1)
+        pct = int(x * 100)
+        if total_pos > 0:
+            out[f"captura_top{pct}"] = float(cum_pos[j] / total_pos)
+            out[f"precision_top{pct}"] = float(cum_pos[j] / cum_w[j])
+            out[f"lift_top{pct}"] = float((cum_pos[j] / cum_w[j]) / (total_pos / total_w))
+        else:
+            out[f"captura_top{pct}"] = out[f"precision_top{pct}"] = out[f"lift_top{pct}"] = np.nan
     return out
 
 
 def metricas(y, p, w=None):
+    """
+    Discriminación: AUC, Gini (= 2·AUC − 1, la forma usual en riesgo de crédito),
+    PR-AUC y captura / precisión / lift en el top. Calibración: Brier y cociente
+    entre la probabilidad media predicha y la tasa observada (1 = calibrado; con
+    scale_pos_weight los boostings dan probabilidades infladas, > 1).
+    """
     if w is None:
         w = np.ones(len(y))
     if y.min() == y.max():
         return {}
-    m = {"prevalencia": float(np.average(y, weights=w)),
-         "auc": roc_auc_score(y, p, sample_weight=w),
+    prev = float(np.average(y, weights=w))
+    auc = roc_auc_score(y, p, sample_weight=w)
+    m = {"prevalencia": prev, "auc": auc, "gini": 2 * auc - 1,
          "pr_auc": average_precision_score(y, p, sample_weight=w)}
     m.update(capturas(y, p, w))
+    m["brier"] = float(np.average((p - y) ** 2, weights=w))
+    m["p_media_sobre_tasa"] = float(np.average(p, weights=w) / prev)
     return m
 
 
@@ -492,6 +511,9 @@ def main():
     ap.add_argument("--bootstrap", type=int, default=100)
     ap.add_argument("--reusar-tuning", action="store_true",
                     help="usar el tuning.csv ya guardado de esta corrida en vez de repetir la búsqueda")
+    ap.add_argument("--solo-evaluar", action="store_true",
+                    help="no entrenar: cargar el modelo ya guardado de esta corrida y recalcular "
+                         "las métricas de test (por ejemplo, al agregar métricas nuevas)")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -521,6 +543,22 @@ def main():
         return df, y
 
     resultado = {"corrida": nombre, "args": vars(args), "features": features}
+
+    if args.solo_evaluar:
+        # se conservan train, hiperparámetros y tiempos de la corrida original
+        previo = json.loads((out / "metricas.json").read_text(encoding="utf-8"))
+        if previo["features"] != features:
+            raise ValueError("las variables no coinciden con las del modelo guardado")
+        print(f"\n[1-4] Cargando el modelo guardado de {out} (sin reentrenar)")
+        if args.modelo == "xgboost":
+            modelo = xgb.Booster(model_file=str(out / "modelo.json"))
+        elif args.modelo == "lightgbm":
+            modelo = lgb.Booster(model_file=str(out / "modelo.txt"))
+        else:
+            modelo = joblib.load(out / "modelo.joblib")
+        evaluar(args, features, oot_col, out, funcion_prediccion(args.modelo, modelo, features),
+                {**previo, "reevaluado": time.strftime("%Y-%m-%d %H:%M")}, t0)
+        return
 
     # ── búsqueda de hiperparámetros (solo boosting), con su muestra de CUITs ──
     # Se carga solo la muestra de tuning y se libera antes de cargar todo train,
@@ -605,7 +643,6 @@ def main():
             imp = pd.DataFrame({"variable": features,
                                 "ganancia": [gan.get(f, 0.0) for f in features],
                                 "splits": [spl.get(f, 0) for f in features]})
-            predecir = lambda X: modelo.predict(xgb.DMatrix(X, enable_categorical=True))
         else:
             try:
                 dtr = lgb.Dataset(X_tr, y_tr, feature_name=features,
@@ -619,10 +656,6 @@ def main():
             imp = pd.DataFrame({"variable": modelo.feature_name(),
                                 "ganancia": modelo.feature_importance("gain"),
                                 "splits": modelo.feature_importance("split")})
-            # se predice de a tramos con la misma codificación que en el entrenamiento
-            predecir = lambda X: np.concatenate(
-                [modelo.predict(a_matriz(X.iloc[i:i + 1_000_000], features))
-                 for i in range(0, len(X), 1_000_000)])
         imp["ganancia_pct"] = imp["ganancia"] / imp["ganancia"].sum() * 100
         imp.sort_values("ganancia", ascending=False).to_csv(out / "importancia.csv", index=False)
         resultado["hiperparametros"] = {**mejor, "arboles": arboles}
@@ -637,8 +670,23 @@ def main():
         coef["abs"] = coef["coeficiente"].abs()
         coef.sort_values("abs", ascending=False).drop(columns="abs") \
             .to_csv(out / "importancia.csv", index=False)
-        predecir = lambda X: modelo.predict_proba(X)[:, 1]
 
+    evaluar(args, features, oot_col, out, funcion_prediccion(args.modelo, modelo, features),
+            resultado, t0)
+
+
+def funcion_prediccion(tipo, modelo, features):
+    if tipo == "xgboost":
+        return lambda X: modelo.predict(xgb.DMatrix(X, enable_categorical=True))
+    if tipo == "lightgbm":
+        # de a tramos, con la misma codificación que en el entrenamiento
+        return lambda X: np.concatenate(
+            [modelo.predict(a_matriz(X.iloc[i:i + 1_000_000], features))
+             for i in range(0, len(X), 1_000_000)])
+    return lambda X: modelo.predict_proba(X)[:, 1]
+
+
+def evaluar(args, features, oot_col, out, predecir, resultado, t0):
     # ── test (una sola vez) ──
     print(f"\n[5] Evaluando en test...")
     te = cargar(TEST, features, args.target, oot_col, "test", args.frac_datos)
@@ -668,7 +716,9 @@ def main():
         "todas_las_filas": metricas(y_te, p_te),
         "una_fila_por_cuit": metricas(y_te[una_fila], p_te[una_fila]),
     }
-    resultado["minutos"] = round((time.time() - t0) / 60, 1)
+    # al reevaluar se conserva el tiempo de la corrida original
+    clave_t = "minutos_reevaluacion" if "reevaluado" in resultado else "minutos"
+    resultado[clave_t] = round((time.time() - t0) / 60, 1)
     with open(out / "metricas.json", "w", encoding="utf-8") as f:
         json.dump(resultado, f, indent=2, ensure_ascii=False)
 
@@ -678,13 +728,13 @@ def main():
           f"{', IC 95% bootstrap por CUIT' if ic else ''}):")
     for c in cols_m:
         extra = f"  IC [{ic[c][0]:.4f}, {ic[c][1]:.4f}]" if c in ic else ""
-        print(f"    {c:<14} {r['por_mes_media'][c]:.4f} ± {r['por_mes_sd'][c]:.4f}{extra}")
+        print(f"    {c:<18} {r['por_mes_media'][c]:.4f} ± {r['por_mes_sd'][c]:.4f}{extra}")
     for etiqueta, clave in (("Todas las filas juntas", "todas_las_filas"),
                             ("Una fila por CUIT", "una_fila_por_cuit")):
         mm = r[clave]
         print(f"  {etiqueta:<23}: AUC {mm['auc']:.4f}  PR-AUC {mm['pr_auc']:.4f}  "
               f"(prevalencia {mm['prevalencia']*100:.2f}%)")
-    print(f"\n  Resultados en {out}  ({resultado['minutos']} min)")
+    print(f"\n  Resultados en {out}  ({resultado[clave_t]} min)")
 
 
 if __name__ == "__main__":

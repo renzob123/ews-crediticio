@@ -126,6 +126,38 @@ Cada corrida es una combinación de modelo × target × validación × montos ×
 - **Validación OOT:** entrena con los CUITs de train en los meses OOT "train" y evalúa con los CUITs de test en los meses OOT "test".
 - **Hallazgo (prueba con 2% de los CUITs):** con una fila al azar por CUIT, la prevalencia de B sube de ~7,7% a ~15,5%. Los que caen en mora salen de sit 1 y aportan menos filas al panel; los buenos pagadores aportan muchas. Con todas las filas pesan más los clientes estables, lo que es coherente con el uso real (cada mes se puntúa a toda la cartera en sit 1).
 
+### 2.12 Resultados: modelo principal (XGBoost, target B, validación por CUIT, con macro; 2026-11-22)
+- Train: 23,2M filas, 1,64M CUITs, 202407-202601, 7,54% positivos. Test: 5,8M filas, 409 mil CUITs, 19 meses de scoring, 7,56% positivos.
+- Hiperparámetros (6 configuraciones, todas con PR-AUC CV entre 0,318 y 0,323): max_depth 6, learning_rate 0,05, min_child_weight 1, colsample 0,8, subsample 1, lambda 1, 783 árboles.
+- **Métricas por mes de scoring (media ± desvío entre meses; IC 95% bootstrap por CUIT):** AUC 0,807 ± 0,013 [0,806; 0,808]; PR-AUC 0,315 ± 0,054 [0,312; 0,317]; captura top 5% 27,1%; **top 10% 42,6%** [42,4; 42,9]; top 20% 61,7%.
+- Todas las filas juntas: AUC 0,813, PR-AUC 0,327. Una fila por CUIT: AUC 0,818, PR-AUC 0,494 (prevalencia 14,9%).
+- **Estabilidad entre meses:** el AUC va de 0,780 (202407) a 0,823 (202504) y la captura del top 10% se mantiene entre 41% y 44%. El PR-AUC varía más (0,20-0,38) porque acompaña a la prevalencia del mes (4,5%-9,2%): con más positivos el PR-AUC sube aunque la capacidad de ordenar sea similar.
+- **Importancia (ganancia):** n_entidades_otras_t 23,5%, otras_tiene_billetera 16,2%, meses_consec_normal_sant_6m 9,9%, rango_edad_proxy 7,3%, otras_tiene_prov_nofin 5,0%. El endeudamiento en otras entidades (sobre todo billeteras y proveedores no financieros) es la señal principal. Las 10 variables macro suman 3,0% de la ganancia: aportan poco a nivel individual, como se esperaba (son iguales para todos los clientes de un mes). Falta confirmarlo con la corrida sin macro.
+- Duración: ~6,7 h en total (con 2 h de hibernación de la PC en el medio; el proceso siguió igual).
+
+- **Reevaluación con las métricas de 2.14 (2026-11-22, `--solo-evaluar`, mismos AUC y PR-AUC):** Gini 0,614 [0,611; 0,617]; precisión top 5/10/20% = 40,7% / 32,1% / 23,3%; lift = 5,4 / 4,3 / 3,1; Brier 0,172; probabilidad media sobre tasa = 5,1 (no calibrado, como se esperaba por `scale_pos_weight`). La reevaluación de la logística se cortó por memoria al predecir test (el pipeline de sklearn pasa a float64 y copia los datos); queda pendiente.
+
+### 2.13 Resultados: modelo base (regresión logística, mismo escenario; 2026-11-22)
+- Entrenada con el 25% de los CUITs de train (5,8M filas). La primera vez se cortó por memoria: el pipeline de sklearn llega a ~7,8 GB de pico al preparar los datos (float64 y copias). En el segundo intento, con ~7 GB libres, terminó en 10 minutos.
+- **Métricas por mes:** AUC 0,778 ± 0,016 [0,776; 0,779]; PR-AUC 0,261 ± 0,051; captura top 10% 37,8% [37,5; 38,1]; top 20% 56,8%.
+- **XGBoost vs logística:** +0,029 de AUC, +0,054 de PR-AUC y +4,8 puntos de captura en el top 10% (42,6% vs 37,8%). XGBoost es mejor en los 19 meses y los IC no se superponen. La ventaja es mayor en los meses extremos (202407: AUC 0,780 vs 0,743), lo que sugiere relaciones no lineales que la logística no capta.
+- Coeficientes (variables estandarizadas): la edad es lo que más pesa (65+ y 50-65 reducen el riesgo frente a 18-30), seguida de los montos en otras entidades y los meses seguidos en situación normal. Hay variables muy correlacionadas (monto real y decil de monto en otras entidades, con signos opuestos), así que los coeficientes individuales no deben interpretarse como efectos aislados.
+
+### 2.13b Resultados: XGBoost con validación OOT (target B, con macro; 2026-11-22)
+- Train OOT: 12,3M filas, 1,51M CUITs, t de 202407 a 202504 (10 meses, aprox. la mitad de filas que la validación por CUIT). Hueco de 6 meses. Test: CUITs de test en 202511–202601 (875.703 filas, 3 meses, 7,35% de positivos). Tardó 2,9 h (el train más chico acelera el tuning).
+- Tuning: la mejor configuración es la misma que en la validación por CUIT (max_depth 6, lr 0,05, min_child_weight 1, colsample 0,8, subsample 1, lambda 1), con 593 árboles (783 por CUIT). Las 6 configuraciones dieron PR-AUC CV entre 0,288 y 0,296: el resultado es poco sensible a los hiperparámetros.
+- **Métricas por mes:** AUC 0,787 ± 0,004 [0,785; 0,790]; PR-AUC 0,274 [0,268; 0,278]; captura top 10% 39,3% [38,8; 39,7]; top 20% 57,9%.
+- **Comparación justa con la validación por CUIT:** el test OOT son exactamente las mismas filas que el test por CUIT en esos 3 meses (mismos n). En esos meses el modelo OOT pierde en promedio **−0,010 de AUC, −0,018 de PR-AUC y −1,8 puntos de captura top 10%** (por ejemplo, 202511: AUC 0,800 → 0,791). La caída de la media general (0,807 → 0,787) se explica sobre todo porque los últimos meses son más difíciles también para el modelo por CUIT (menor prevalencia, AUC ~0,795), no por la validación temporal.
+- **Lectura:** el modelo es estable en el tiempo: entrenado con datos que terminan 6 meses antes y con la mitad de historia, conserva casi toda la capacidad de discriminación.
+- Importancia: las mismas variables arriba, con otro orden (otras_tiene_billetera 22,9%, n_entidades_otras_t 14,9%, meses_consec_normal_sant_6m 14,3%, rango_edad_proxy 7,6%). Macro: 2,1% del total.
+
+### 2.14 Métricas de evaluación con clases desbalanceadas (decidida 2026-11-22)
+- **Problema:** con 7,6% de positivos, el AUC no depende de la prevalencia y puede verse bien aunque la lista de alertas tenga muchos falsos positivos.
+- **Métricas principales:** PR-AUC (la base al azar es la prevalencia, ~0,076) y, para el top 5/10/20% de scores, **captura, precisión y lift**. Responden la pregunta operativa del EWS: si se revisa a los N clientes de peor score, cuántos problemas se encuentran.
+- **Métricas secundarias:** AUC y **Gini (= 2·AUC − 1)**. Son el estándar en riesgo de crédito y permiten comparar con la literatura.
+- **Calibración:** Brier y el cociente entre la probabilidad media predicha y la tasa observada (1 = calibrado). En la prueba con el 2% de los CUITs, XGBoost da 5,2: la probabilidad media predicha es ~5 veces la tasa real, por `scale_pos_weight`. El Brier (0,177) es peor que predecir la prevalencia para todos (~0,07). **Los scores ordenan bien, pero no son probabilidades.** Para usarlos como PD habría que recalibrarlos (por ejemplo, con regresión isotónica o Platt sobre una parte de train). Si el EWS solo usa el ranking, no hace falta.
+- **Implementación:** `04_modelado.py --solo-evaluar` carga el modelo guardado y recalcula las métricas de test sin reentrenar, conservando train, hiperparámetros y tiempos de la corrida original. Se verificó con el modelo de prueba del 2%: AUC y PR-AUC idénticos a la corrida original (0,7971 / 0,2907).
+
 ## 3. Limitaciones
 
 1. **Target C sin validación fuera de tiempo.** Sus métricas son una cota superior optimista. Como referencia se usa la caída CUIT→OOT observada en A y B.
