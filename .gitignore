@@ -16,3 +16,8 @@ __pycache__/
 *.pyc
 .venv/
 .ipynb_checkpoints/
+
+# Modelado: los modelos entrenados y las corridas de prueba no van al repo
+# (las métricas agregadas de resultados/ sí se pueden versionar)
+resultados/**/modelo.*
+resultados/*_prueba*/
