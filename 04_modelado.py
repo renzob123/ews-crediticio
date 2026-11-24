@@ -683,7 +683,9 @@ def funcion_prediccion(tipo, modelo, features):
         return lambda X: np.concatenate(
             [modelo.predict(a_matriz(X.iloc[i:i + 1_000_000], features))
              for i in range(0, len(X), 1_000_000)])
-    return lambda X: modelo.predict_proba(X)[:, 1]
+    # de a tramos: el pipeline pasa a float64 y copia los datos (con todo test no entra en memoria)
+    return lambda X: np.concatenate(
+        [modelo.predict_proba(X.iloc[i:i + 500_000])[:, 1] for i in range(0, len(X), 500_000)])
 
 
 def evaluar(args, features, oot_col, out, predecir, resultado, t0):

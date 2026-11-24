@@ -135,13 +135,14 @@ Cada corrida es una combinación de modelo × target × validación × montos ×
 - **Importancia (ganancia):** n_entidades_otras_t 23,5%, otras_tiene_billetera 16,2%, meses_consec_normal_sant_6m 9,9%, rango_edad_proxy 7,3%, otras_tiene_prov_nofin 5,0%. El endeudamiento en otras entidades (sobre todo billeteras y proveedores no financieros) es la señal principal. Las 10 variables macro suman 3,0% de la ganancia: aportan poco a nivel individual, como se esperaba (son iguales para todos los clientes de un mes). Falta confirmarlo con la corrida sin macro.
 - Duración: ~6,7 h en total (con 2 h de hibernación de la PC en el medio; el proceso siguió igual).
 
-- **Reevaluación con las métricas de 2.14 (2026-11-22, `--solo-evaluar`, mismos AUC y PR-AUC):** Gini 0,614 [0,611; 0,617]; precisión top 5/10/20% = 40,7% / 32,1% / 23,3%; lift = 5,4 / 4,3 / 3,1; Brier 0,172; probabilidad media sobre tasa = 5,1 (no calibrado, como se esperaba por `scale_pos_weight`). La reevaluación de la logística se cortó por memoria al predecir test (el pipeline de sklearn pasa a float64 y copia los datos); queda pendiente.
+- **Reevaluación con las métricas de 2.14 (2026-11-22, `--solo-evaluar`, mismos AUC y PR-AUC):** Gini 0,614 [0,611; 0,617]; precisión top 5/10/20% = 40,7% / 32,1% / 23,3%; lift = 5,4 / 4,3 / 3,1; Brier 0,172; probabilidad media sobre tasa = 5,1 (no calibrado, como se esperaba por `scale_pos_weight`). La primera reevaluación de la logística se cortó por memoria al predecir test (el pipeline de sklearn pasa a float64 y copia los datos); se resolvió prediciendo de a 500 mil filas.
 
 ### 2.13 Resultados: modelo base (regresión logística, mismo escenario; 2026-11-22)
 - Entrenada con el 25% de los CUITs de train (5,8M filas). La primera vez se cortó por memoria: el pipeline de sklearn llega a ~7,8 GB de pico al preparar los datos (float64 y copias). En el segundo intento, con ~7 GB libres, terminó en 10 minutos.
 - **Métricas por mes:** AUC 0,778 ± 0,016 [0,776; 0,779]; PR-AUC 0,261 ± 0,051; captura top 10% 37,8% [37,5; 38,1]; top 20% 56,8%.
 - **XGBoost vs logística:** +0,029 de AUC, +0,054 de PR-AUC y +4,8 puntos de captura en el top 10% (42,6% vs 37,8%). XGBoost es mejor en los 19 meses y los IC no se superponen. La ventaja es mayor en los meses extremos (202407: AUC 0,780 vs 0,743), lo que sugiere relaciones no lineales que la logística no capta.
 - Coeficientes (variables estandarizadas): la edad es lo que más pesa (65+ y 50-65 reducen el riesgo frente a 18-30), seguida de los montos en otras entidades y los meses seguidos en situación normal. Hay variables muy correlacionadas (monto real y decil de monto en otras entidades, con signos opuestos), así que los coeficientes individuales no deben interpretarse como efectos aislados.
+- Reevaluación con las métricas de 2.14: Gini 0,556 [0,552; 0,558]; precisión top 10% 28,5% (XGBoost 32,1%); lift top 10% 3,8× (XGBoost 4,3×); Brier 0,185; probabilidad media sobre tasa 5,4. La logística también sale descalibrada porque usa `class_weight="balanced"`, que tiene el mismo efecto que `scale_pos_weight`.
 
 ### 2.13b Resultados: XGBoost con validación OOT (target B, con macro; 2026-11-22)
 - Train OOT: 12,3M filas, 1,51M CUITs, t de 202407 a 202504 (10 meses, aprox. la mitad de filas que la validación por CUIT). Hueco de 6 meses. Test: CUITs de test en 202511–202601 (875.703 filas, 3 meses, 7,35% de positivos). Tardó 2,9 h (el train más chico acelera el tuning).
@@ -149,7 +150,16 @@ Cada corrida es una combinación de modelo × target × validación × montos ×
 - **Métricas por mes:** AUC 0,787 ± 0,004 [0,785; 0,790]; PR-AUC 0,274 [0,268; 0,278]; captura top 10% 39,3% [38,8; 39,7]; top 20% 57,9%.
 - **Comparación justa con la validación por CUIT:** el test OOT son exactamente las mismas filas que el test por CUIT en esos 3 meses (mismos n). En esos meses el modelo OOT pierde en promedio **−0,010 de AUC, −0,018 de PR-AUC y −1,8 puntos de captura top 10%** (por ejemplo, 202511: AUC 0,800 → 0,791). La caída de la media general (0,807 → 0,787) se explica sobre todo porque los últimos meses son más difíciles también para el modelo por CUIT (menor prevalencia, AUC ~0,795), no por la validación temporal.
 - **Lectura:** el modelo es estable en el tiempo: entrenado con datos que terminan 6 meses antes y con la mitad de historia, conserva casi toda la capacidad de discriminación.
+- Reevaluación con las métricas de 2.14: Gini 0,574 [0,570; 0,580]; precisión top 10% 28,8%; lift top 10% 3,9×; Brier 0,204; probabilidad media sobre tasa 5,7.
 - Importancia: las mismas variables arriba, con otro orden (otras_tiene_billetera 22,9%, n_entidades_otras_t 14,9%, meses_consec_normal_sant_6m 14,3%, rango_edad_proxy 7,6%). Macro: 2,1% del total.
+
+### 2.13c Resultados: XGBoost sin macro (target B, validación por CUIT; 2026-11-23)
+- 41 variables (sin las 10 macro). Misma mejor configuración que con macro, con 721 árboles. Tardó 5,7 h.
+- **Métricas por mes:** AUC 0,805 [0,803; 0,806]; Gini 0,609; PR-AUC 0,308; captura top 10% 42,0%; precisión top 10% 31,7%; lift top 10% 4,2×.
+- **Con macro vs sin macro:** la macro suma **+0,0025 de AUC, +0,006 de PR-AUC y +0,6 puntos de captura top 10%**. Es poco, pero consistente: es mejor en los **19 de 19 meses**. La ganancia es mayor en los meses de los extremos (202407: +0,006 de AUC y +1,9 puntos de captura; 202601: +0,004), que es donde las condiciones macro se apartan más del promedio.
+- **Cómo puede ayudar la macro dentro de un mes:** las métricas se calculan mes a mes y la macro vale lo mismo para todos los clientes de un mes, así que por sí sola no cambia el orden. Solo puede ayudar por **interacciones** (por ejemplo, que tener billetera o muchas entidades pese distinto según la mora del sistema o las tasas). Eso explica que el efecto sea chico.
+- **Cuidado:** en la validación por CUIT el modelo vio esos mismos meses en train, así que la macro podría estar funcionando en parte como un identificador del mes. La prueba más honesta es la OOT sin macro (pendiente).
+- Sin macro, la importancia se concentra más en n_entidades_otras_t (30,6%), seguida de otras_tiene_billetera (13,2%) y meses_consec_normal_sant_6m (10,9%).
 
 ### 2.14 Métricas de evaluación con clases desbalanceadas (decidida 2026-11-22)
 - **Problema:** con 7,6% de positivos, el AUC no depende de la prevalencia y puede verse bien aunque la lista de alertas tenga muchos falsos positivos.
