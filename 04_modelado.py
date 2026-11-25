@@ -15,7 +15,8 @@ Entrena y evalúa un modelo sobre dataset_train.parquet / dataset_test.parquet
                       (la más conservadora: otras personas y meses posteriores)
   --montos      principal (reales con CER + ratios/deciles) | nominal | real | ratios
                 (sensibilidad de la duda 2)
-  --sin-macro   sin las 10 variables macro (duda 5: con vs sin macro)
+  --macro       agrega las 10 variables macro (sensibilidad; desde 2026-11-25 el
+                modelo principal va sin macro porque fuera de tiempo no aporta)
 
 Metodología (docs/decisiones_metodologicas.md, dudas 4 y 6):
   - Se entrena con todas las filas (una por CUIT × período).
@@ -43,10 +44,10 @@ Salidas en resultados/<corrida>/:
 No se guardan scores por CUIT.
 
 Uso:
-  python 04_modelado.py                                   # xgboost, target_b, cuit, principal, con macro
+  python 04_modelado.py                                   # xgboost, target_b, cuit, principal, sin macro
   python 04_modelado.py --modelo lightgbm
   python 04_modelado.py --modelo logistica
-  python 04_modelado.py --validacion oot --sin-macro
+  python 04_modelado.py --validacion oot --macro
   python 04_modelado.py --frac-datos 0.02                 # prueba rápida con 2% de los CUITs
 Requiere: pandas, pyarrow, scikit-learn, xgboost, lightgbm, joblib
 """
@@ -499,7 +500,7 @@ def main():
                     choices=[f"target_{t}{s}" for s in ("", "_t1") for t in "abc"])
     ap.add_argument("--validacion", choices=["cuit", "oot"], default="cuit")
     ap.add_argument("--montos", choices=list(CONJUNTOS_MONTOS), default="principal")
-    ap.add_argument("--sin-macro", action="store_true")
+    ap.add_argument("--macro", action="store_true", help="agregar las variables macro")
     ap.add_argument("--frac-datos", type=float, default=1.0,
                     help="fracción de CUITs a usar en train y test (para pruebas rápidas)")
     ap.add_argument("--frac-tuning", type=float, default=0.2,
@@ -517,10 +518,10 @@ def main():
     args = ap.parse_args()
 
     t0 = time.time()
-    features = BASE + CONJUNTOS_MONTOS[args.montos] + ([] if args.sin_macro else MACRO) + CATEGORICAS
+    features = BASE + CONJUNTOS_MONTOS[args.montos] + (MACRO if args.macro else []) + CATEGORICAS
     oot_col = "oot_" + args.target.removeprefix("target_") if args.validacion == "oot" else None
     nombre = (f"{args.modelo}_{args.target}_{args.validacion}_{args.montos}_"
-              f"{'sinmacro' if args.sin_macro else 'macro'}"
+              f"{'macro' if args.macro else 'sinmacro'}"
               + (f"_prueba{args.frac_datos:g}" if args.frac_datos < 1 else ""))
     out = OUT_DIR / nombre
     out.mkdir(parents=True, exist_ok=True)

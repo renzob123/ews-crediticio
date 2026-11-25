@@ -67,6 +67,7 @@ Un mismo CUIT aparece en muchos períodos, con filas muy parecidas, así que esa
 - Solo afecta al modelado, no a los scripts 02 y 03.
 
 ### 2.7 Duda 5: variables macro (decidida 2026-11-17, rezagos en revisión)
+- **Resultado (2026-11-25):** la macro no aporta fuera de tiempo (2.13c, 2.13d). **El modelo principal pasa a ser sin macro**; las corridas con macro quedan como sensibilidad.
 - Se entrenan modelos **con y sin variables macro** y se comparan. No está claro que aporten: son constantes dentro de cada mes, así que no pueden ordenar deudores dentro de un mismo mes de scoring salvo por interacciones con las variables individuales. Además, con pocos meses de entrenamiento hay riesgo de sobreajustar al período.
 - En la versión con macro, cada variable debe usar **el último dato publicado al momento del scoring** (fines de *t+1*) para evitar fuga de información. La tabla de rezagos está en revisión (ver 4.4).
 - **Se eliminan las 7 columnas macro rotas** (decidido 2026-11-18): resultado_neto_mensual, intereses_ganados, intereses_pagados, margen_intermediacion, roa_proxy, tasa_hipotecarios_privado_pct y n_entidades_financieras.
@@ -161,6 +162,15 @@ Cada corrida es una combinación de modelo × target × validación × montos ×
 - **Cuidado:** en la validación por CUIT el modelo vio esos mismos meses en train, así que la macro podría estar funcionando en parte como un identificador del mes. La prueba más honesta es la OOT sin macro (pendiente).
 - Sin macro, la importancia se concentra más en n_entidades_otras_t (30,6%), seguida de otras_tiene_billetera (13,2%) y meses_consec_normal_sant_6m (10,9%).
 
+### 2.13d Resultados: XGBoost OOT sin macro (target B; 2026-11-24)
+- Mismo train y test que la OOT con macro. El tuning eligió otra configuración (max_depth 4, lr 0,1, min_child_weight 1, colsample 0,6, lambda 10; 816 árboles), aunque empatada con la de siempre (PR-AUC CV 0,2906 vs 0,2905). Tardó 2,5 h.
+- **Métricas por mes:** AUC 0,787 [0,785; 0,790]; PR-AUC 0,271; captura top 10% 39,0%; precisión top 10% 28,7%; lift 3,9×.
+- **OOT con macro vs sin macro:** +0,0001 de AUC, +0,003 de PR-AUC y +0,2 puntos de captura top 10%. En AUC es empate (202512 sale mejor sin macro). La ganancia de la macro que se veía en la validación por CUIT (+0,0025 de AUC, 19 de 19 meses) **prácticamente desaparece en meses que el modelo no vio**.
+- **Interpretación:** es consistente con que, en la validación por CUIT, la macro funcionaba en parte como un identificador del mes y no como una señal que se generalice al futuro. Atenuantes: el train OOT tiene solo 10 meses de *t*, con poca variación macro para aprender, y los meses de test pueden tener valores macro fuera del rango visto en train.
+- **Conclusión para la tesis:** con estos datos, la macro **no aporta capacidad predictiva fuera de tiempo**. El riesgo lo explica el comportamiento del cliente en el sistema financiero.
+- **Decisión (2026-11-25): el modelo principal pasa a ser sin macro.** Con el mismo desempeño fuera de tiempo, es más simple de explicar y de mantener (no depende de la publicación de las series del BCRA). Las corridas con macro quedan como sensibilidad. En `04_modelado.py` el valor por defecto pasa a sin macro y la opción `--sin-macro` se reemplaza por `--macro`. Nuevo resultado principal: XGBoost por CUIT sin macro (AUC 0,805, PR-AUC 0,308, captura top 10% 42,0%; sección 2.13c). La logística base se vuelve a correr sin macro para comparar en igualdad de condiciones.
+- Importancia sin macro (OOT): otras_tiene_billetera 23,0%, meses_consec_normal_sant_6m 12,3%, n_entidades_otras_t 9,8%, rango_edad_proxy 8,1%.
+
 ### 2.14 Métricas de evaluación con clases desbalanceadas (decidida 2026-11-22)
 - **Problema:** con 7,6% de positivos, el AUC no depende de la prevalencia y puede verse bien aunque la lista de alertas tenga muchos falsos positivos.
 - **Métricas principales:** PR-AUC (la base al azar es la prevalencia, ~0,076) y, para el top 5/10/20% de scores, **captura, precisión y lift**. Responden la pregunta operativa del EWS: si se revisa a los N clientes de peor score, cuántos problemas se encuentran.
@@ -177,6 +187,7 @@ Cada corrida es una combinación de modelo × target × validación × montos ×
 5. **Rezago de publicación.** Obliga a dejar fuera *t+1*, lo que reduce la ventana efectiva de predicción.
 6. **Series macro revisadas, no en tiempo real.** El BCRA revisa datos hacia atrás (por ejemplo, la tasa de consumo de 202608 pasó de 79,37 a 78,83 entre el 27/10 y el 18/11/2026). Se usan los valores revisados a la fecha de descarga, no los que el banco veía en cada momento. Los rezagos de publicación se infieren de solo dos descargas.
 7. **Huecos en las series del BCRA.** Faltan 202601 y 202609 en la situación de cartera del sistema y en BADLAR. Quedan vacíos, igual que las variaciones a 3 meses que dependen de esos meses.
+8. **La macro no generaliza fuera de tiempo.** Con 31 meses de historia (10 de train OOT para B) hay muy poca variación macro para aprender; su aporte en la validación por CUIT desaparece en OOT (2.13d). Un panel más largo, con un ciclo completo, podría cambiar este resultado.
 
 ---
 
