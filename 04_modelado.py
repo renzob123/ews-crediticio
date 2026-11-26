@@ -307,7 +307,7 @@ def a_matriz(df: pd.DataFrame, features: list) -> np.ndarray:
 def train_en_disco(path, features, target, oot_col, oot_valor, frac, archivo):
     """
     Escribe las variables de train de a bloques en un archivo binario float32 y
-    lo devuelve abierto como memory-map, junto con el target y los datos
+    lo devuelve como SecuenciaDisco (lectura por tramos), junto con el target y los datos
     descriptivos de train. El sistema operativo lee el archivo a demanda, así
     que todo train nunca ocupa RAM a la vez (para LightGBM con todo train).
     """
@@ -328,8 +328,46 @@ def train_en_disco(path, features, target, oot_col, oot_valor, frac, archivo):
              "periodos": [int(per[0]), int(per[1])] if filas else [0, 0],
              "positivos": int(y.sum()),
              "prevalencia": float(y.mean()) if filas else float("nan")}
-    X = np.memmap(archivo, dtype=np.float32, mode="r", shape=(filas, len(features))) if filas else None
+    X = SecuenciaDisco(archivo, filas, len(features)) if filas else None
     return X, y, stats
+
+
+class SecuenciaDisco(lgb.Sequence):
+    """
+    Entrega a LightGBM el archivo de train de a tramos, leyéndolo con lecturas
+    comunes. Con un memory-map, el sistema contaba como ocupadas las páginas ya
+    leídas del archivo (3,8 GB con todo train) y la memoria libre bajaba a menos
+    de 3 GB al armar el Dataset.
+    """
+    batch_size = 500_000
+
+    def __init__(self, archivo, filas, ncol):
+        self.archivo, self.filas, self.ncol = str(archivo), filas, ncol
+        self.ancho = ncol * 4   # bytes por fila (float32)
+        self._f = None
+
+    def _leer(self, ini, n):
+        if self._f is None:
+            self._f = open(self.archivo, "rb")
+        self._f.seek(ini * self.ancho)
+        return np.frombuffer(self._f.read(n * self.ancho), dtype=np.float32).reshape(n, self.ncol)
+
+    def cerrar(self):
+        if self._f is not None:
+            self._f.close(); self._f = None
+
+    def __len__(self):
+        return self.filas
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            ini, fin, paso = idx.indices(self.filas)
+            assert paso == 1
+            return self._leer(ini, max(fin - ini, 0))
+        # filas sueltas: las usa LightGBM para la muestra de cortes, que exige float64
+        if isinstance(idx, list):
+            return np.vstack([self._leer(int(i), 1) for i in idx]).astype(np.float64)
+        return self._leer(int(idx) % self.filas, 1)[0].astype(np.float64)
 
 
 # ── métricas ──────────────────────────────────────────────────────────────────────
@@ -605,7 +643,7 @@ def main():
         resultado["train"] = {k: st[k] for k in ("filas", "cuits", "periodos", "prevalencia")}
         spw = (st["filas"] - st["positivos"]) / st["positivos"]
     elif args.modelo == "lightgbm":
-        # LightGBM arma su Dataset desde un memory-map en disco (ver train_en_disco)
+        # LightGBM arma su Dataset leyendo train de a tramos desde disco (ver train_en_disco)
         print(f"\n[3] Escribiendo train a disco por bloques (fracción de CUITs {args.frac_datos:g})...")
         cache_dir = tempfile.mkdtemp(prefix="lgb_cache_")   # se borra al terminar de entrenar
         X_tr, y_tr, st = train_en_disco(TRAIN, features, args.target, oot_col,
@@ -646,12 +684,19 @@ def main():
                                 "splits": [spl.get(f, 0) for f in features]})
         else:
             try:
+                # histogramas por columna: con todo train, el modo por filas duplica los
+                # datos discretizados (pico de 5 GB vs 3,5 GB) y es más lento
+                params["force_col_wise"] = True
                 dtr = lgb.Dataset(X_tr, y_tr, feature_name=features,
                                   categorical_feature=[c for c in features if c in CATEGORICAS],
-                                  free_raw_data=True)
+                                  free_raw_data=True, params=params)
+                dtr.construct()            # discretiza leyendo el archivo de a tramos
+                X_tr.cerrar(); X_tr = None; gc.collect()
                 modelo = lgb.train(params, dtr, arboles)
             finally:
-                dtr = X_tr = None; gc.collect()   # cerrar el memory-map antes de borrar
+                if X_tr is not None:
+                    X_tr.cerrar()
+                dtr = X_tr = None; gc.collect()   # cerrar el archivo antes de borrar
                 shutil.rmtree(cache_dir, ignore_errors=True)
             modelo.save_model(str(out / "modelo.txt"))
             imp = pd.DataFrame({"variable": modelo.feature_name(),
