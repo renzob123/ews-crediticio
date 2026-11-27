@@ -177,6 +177,18 @@ Cada corrida es una combinación de modelo × target × validación × montos ×
 - **Logística sin macro** (base, 25% de los CUITs de train): AUC 0,778; Gini 0,555; PR-AUC 0,261; captura top 10% 37,8%; lift 3,8×. Igual que con macro (+0,0002 de AUC con macro): en la logística, la macro tampoco aporta.
 - **XGBoost vs logística (ambos sin macro):** +0,027 de AUC, +0,048 de PR-AUC, +4,3 puntos de captura top 10%; XGBoost gana en los 19 meses.
 
+### 2.13f Resultados: variantes de montos (XGBoost, target B, validación por CUIT, sin macro; 2026-11-26)
+| Montos | Variables | AUC | PR-AUC | Captura top 10% | Mejor que principal (AUC) |
+|---|---|---|---|---|---|
+| principal (reales + ratios) | 41 | 0,805 | 0,308 | 42,0% | — |
+| solo nominales | 35 | 0,805 (+0,0002) | 0,308 | 42,1% | 16/19 meses |
+| solo reales | 35 | 0,804 (−0,0007) | 0,307 | 42,0% | 2/19 |
+| solo ratios/deciles | 34 | 0,798 (−0,0063) | 0,296 | 40,8% | 0/19 |
+- Cada variante tuvo su tuning propio (unas 4,8 h cada una).
+- **Nominal ≈ real ≈ principal** en la validación por CUIT. Es lo esperable: las métricas se calculan mes a mes y, dentro de un mes, el CER es el mismo para todos, así que deflactar no cambia el orden de los clientes. Además, el modelo vio todos los meses en train, así que puede "aprender" el nivel de precios de cada mes.
+- **Solo ratios pierde** (−0,006 de AUC, −1,2 puntos de captura, en los 19 meses): el tamaño de la deuda en pesos aporta información que los shares y deciles no capturan del todo.
+- **Error de diseño (detectado al terminar):** la decisión 2.4 decía que esta sensibilidad se hace con **validación OOT**, que es donde la inflación importa (en meses futuros los montos nominales quedan fuera del rango visto en train). Estas corridas se hicieron con validación por CUIT; sirven como referencia, pero la comparación relevante es la OOT (pendiente: 3 corridas de unas 2,5 h).
+
 ### 2.14 Métricas de evaluación con clases desbalanceadas (decidida 2026-11-22)
 - **Problema:** con 7,6% de positivos, el AUC no depende de la prevalencia y puede verse bien aunque la lista de alertas tenga muchos falsos positivos.
 - **Métricas principales:** PR-AUC (la base al azar es la prevalencia, ~0,076) y, para el top 5/10/20% de scores, **captura, precisión y lift**. Responden la pregunta operativa del EWS: si se revisa a los N clientes de peor score, cuántos problemas se encuentran.
