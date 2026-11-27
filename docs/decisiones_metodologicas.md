@@ -189,10 +189,17 @@ Cada corrida es una combinación de modelo × target × validación × montos ×
 - **Solo ratios pierde** (−0,006 de AUC, −1,2 puntos de captura, en los 19 meses): el tamaño de la deuda en pesos aporta información que los shares y deciles no capturan del todo.
 - **Error de diseño (detectado al terminar):** la decisión 2.4 decía que esta sensibilidad se hace con **validación OOT**, que es donde la inflación importa (en meses futuros los montos nominales quedan fuera del rango visto en train). Estas corridas se hicieron con validación por CUIT; sirven como referencia, pero la comparación relevante es la OOT (pendiente: 3 corridas de unas 2,5 h).
 
-### 2.13g Resultados: variantes de montos con validación OOT (XGBoost, target B, sin macro; en curso, 2026-11-27)
-- **Solo nominales (OOT):** AUC 0,787 [0,785; 0,790]; PR-AUC 0,270; captura top 10% 39,0%; lift 3,9×. Frente al principal OOT (reales + ratios): +0,0004 de AUC, −0,001 de PR-AUC, −0,02 puntos de captura. **Empate:** aun en meses futuros, con 6 a 9 meses de inflación entre el final de train y el test, usar montos nominales no empeora el modelo. Una explicación posible es que los montos pesan poco frente a las variables de conteo e indicadores (entidades, billeteras, meses en situación normal), y que el árbol usa los montos sobre todo para separar deudas chicas de grandes, una distinción que la inflación de unos meses no llega a borrar.
-- **Solo reales (OOT):** el tuning terminó y quedó guardado, pero la corrida se cortó por falta de memoria del sistema al armar la matriz de train (había 5 GB libres por otros programas abiertos). Pendiente relanzarla con `--reusar-tuning`: usa su propio tuning, que ya terminó.
-- **Solo ratios (OOT):** pendiente.
+### 2.13g Resultados: variantes de montos con validación OOT (XGBoost, target B, sin macro; 2026-11-27)
+| Montos (OOT) | AUC [IC 95%] | PR-AUC | Captura top 10% | Lift top 10% |
+|---|---|---|---|---|
+| principal (reales + ratios) | 0,787 [0,785; 0,790] | 0,271 | 39,0% | 3,9× |
+| solo nominales | 0,787 [0,785; 0,790] | 0,270 | 39,0% | 3,9× |
+| solo reales | 0,787 [0,785; 0,790] | 0,271 | 39,1% | 3,9× |
+| solo ratios/deciles | 0,780 [0,779; 0,783] | 0,258 | 37,8% | 3,8× |
+- Cada variante con su propio tuning. La de reales se cortó una vez por memoria del sistema (5 GB libres por otros programas) después del tuning y se terminó con `--reusar-tuning` sobre su propio tuning.
+- **Nominal = real = principal también fuera de tiempo.** Aun con 6 a 9 meses de inflación entre el final de train y el test, deflactar no mejora el modelo. Una explicación posible es que los montos pesan poco frente a las variables de conteo e indicadores (entidades, billeteras, meses en situación normal), y que el árbol usa los montos sobre todo para separar deudas chicas de grandes, una distinción que la inflación de unos meses no llega a borrar. Con un horizonte más largo o con más inflación, los nominales sí podrían degradarse.
+- **Solo ratios pierde también en OOT** (−0,0065 de AUC, −1,3 puntos de captura, en los 3 meses), igual que en la validación por CUIT en esos mismos meses (−0,007 / −1,5): el tamaño de la deuda en pesos aporta información propia.
+- **Conclusión:** se mantiene el conjunto principal (reales + ratios). Deflactar con CER no cambia los resultados, pero es lo correcto conceptualmente y protege frente a horizontes más largos; los ratios solos no alcanzan.
 
 ### 2.14 Métricas de evaluación con clases desbalanceadas (decidida 2026-11-22)
 - **Problema:** con 7,6% de positivos, el AUC no depende de la prevalencia y puede verse bien aunque la lista de alertas tenga muchos falsos positivos.
